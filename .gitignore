@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+.env
+__pycache__/
+*.pyc
+venv/
+env/
+.venv/
+preque.db
+uploads/
+.DS_Store
+.vscode/
+*.db
+*.log
