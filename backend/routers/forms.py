@@ -526,81 +526,116 @@ def _is_attachment_only_request(labels: list[str], section: str = "") -> bool:
     ])
     asks_for_identifier = any(token in text for token in [
         "number", "no.", "no ", "date", "valid", "expiry", "issued", "authority",
-        "name of", "details of", "gst no", "pan no"
+        "name of", "details of", "gst no", "pan no",
+        # FIX (P0): "No. of X" / "Number of X" / "How many" rows ask for a COUNT,
+        # not a document -- e.g. "No. of projects where bonus is received" was
+        # getting misfired into "Attached" because it mentions neither "number"
+        # verbatim in a way the old check caught, nor did it get excluded properly.
+        "no of", "number of", "how many", "count of",
     ])
     return (asks_for_attachment or mentions_document) and not asks_for_identifier
 
 
+# FIX (P0 -- wrong financial metric / wrong year): deterministic keyword groups.
+# The previous version scored every FinancialRecord with fuzz.token_set_ratio plus
+# a chain of "if/elif" keyword special-cases, so if the *correct* record (e.g. the
+# one whose metric_label actually contains "profit") had a lower base fuzzy score
+# than expected, or its value happened to be stored differently than assumed, an
+# unrelated metric (e.g. "Fixed Assets") could still out-score it once the +35
+# year-match bonus was added on top of a merely-average base score. That's exactly
+# how "Profit of firm" ended up filled with Fixed Assets figures. This replaces all
+# of that with plain substring containment against explicit keyword groups -- no
+# fuzzy score, no bonus stacking, no possibility of a Fixed-Assets record ever
+# satisfying a "profit" query. The fiscal year requirement is now mandatory (not a
+# scoring bonus): if the label mentions a year and no record for that exact metric
+# and year exists, the cell is left blank rather than filled from the wrong year.
+FINANCIAL_METRIC_KEYWORD_GROUPS = [
+    ["turnover", "turn over", "revenue"],
+    ["net profit", "profit after tax", "profit"],
+    ["net worth", "networth", "shareholders fund", "shareholder fund"],
+    ["total assets", "fixed assets", "current assets", "assets"],
+    ["total liabilities", "current liabilities", "liabilities"],
+    ["working capital"],
+]
+
+
 def _match_financial_record(labels: list[str], section: str, db: Session) -> str | None:
     from models.database import FinancialRecord
-    try:
-        from rapidfuzz import fuzz
-    except Exception:
-        fuzz = None
 
     text = " ".join([section] + [str(label) for label in labels if label]).lower()
     if not text:
-        return None
-
-    financial_hint = infer_company_section(text) == "Financial Info"
-    financial_hint = financial_hint or any(token in text for token in [
-        "turnover", "net worth", "assets", "liabilities", "profit", "loss",
-        "working capital", "revenue", "balance sheet", "solvency"
-    ])
-    if not financial_hint:
         return None
 
     def norm(s: str) -> str:
         return re.sub(r'[^a-z0-9]+', ' ', str(s or '').lower()).strip()
 
     norm_text = norm(text)
-    best = None
-    best_score = 0
-    for record in db.query(FinancialRecord).all():
-        if not record.value:
-            continue
-        metric = norm(record.metric_label or record.metric_key or "")
-        if not metric:
-            continue
-        metric_score = fuzz.token_set_ratio(norm_text, metric) if fuzz else (100 if metric in norm_text else 0)
-        
-        # Smart keyword detection for common typos and variations
-        if ("turnover" in norm_text or "turn over" in norm_text or "revenue" in norm_text) and "turnover" in metric:
-            metric_score = 100
-        elif ("profit" in norm_text) and "profit" in metric:
-            metric_score = 100
-        elif ("worth" in norm_text) and "worth" in metric:
-            metric_score = 100
-        elif ("asset" in norm_text) and "asset" in metric:
-            metric_score = 100
-        elif ("liabilit" in norm_text) and "liabilit" in metric:
-            metric_score = 100
 
-        year_match = False
-        for variant in _fiscal_year_variants(record.fiscal_year or ""):
-            if norm(variant) and norm(variant) in norm_text:
-                year_match = True
-                break
-        score = metric_score + (35 if year_match else 0)
-        if score > best_score:
-            best = record
-            best_score = score
+    financial_hint = infer_company_section(text) == "Financial Info"
+    financial_hint = financial_hint or any(
+        kw in norm_text for group in FINANCIAL_METRIC_KEYWORD_GROUPS for kw in group
+    )
+    if not financial_hint:
+        return None
 
-    if not best:
+    # Which keyword group is this label actually asking about? First group that has
+    # any keyword present in the label wins -- groups are ordered most-specific-first
+    # ("net profit" before generic "assets") to avoid a generic word claiming a more
+    # specific field.
+    target_group = None
+    for group in FINANCIAL_METRIC_KEYWORD_GROUPS:
+        if any(kw in norm_text for kw in group):
+            target_group = group
+            break
+    if not target_group:
+        return None
+
+    def record_matches_metric(record) -> bool:
+        metric_text = norm(record.metric_label or record.metric_key or "")
+        return any(kw in metric_text for kw in target_group)
+
+    all_records = db.query(FinancialRecord).all()
+    candidates = [r for r in all_records if r.value and record_matches_metric(r)]
+    if not candidates:
         return None
 
     has_year_hint = bool(re.search(r'\b(?:fy\s*)?\d{2,4}\s*[-/]\s*\d{2,4}\b', text, re.IGNORECASE))
-    best_year_match = any(norm(variant) in norm_text for variant in _fiscal_year_variants(best.fiscal_year or ""))
-    if has_year_hint and not best_year_match:
-        return None
-    if best_score < (105 if has_year_hint else 88):
+
+    if has_year_hint:
+        # A year was mentioned -- ONLY accept a record for that exact fiscal year.
+        # Never fall back to a different year's figure for a year-specific cell.
+        for record in candidates:
+            for variant in _fiscal_year_variants(record.fiscal_year or ""):
+                if norm(variant) and norm(variant) in norm_text:
+                    unit_str = f" {record.unit}" if record.unit else ""
+                    return f"{record.value}{unit_str}"
         return None
 
-    unit_str = f" {best.unit}" if best.unit else ""
-    return f"{best.value}{unit_str}"
+    # No year mentioned -- only safe to answer if there's exactly one candidate for
+    # this metric across the whole company; otherwise it's genuinely ambiguous.
+    if len(candidates) == 1:
+        record = candidates[0]
+        unit_str = f" {record.unit}" if record.unit else ""
+        return f"{record.value}{unit_str}"
+    return None
 
 
 def _match_company_context_value(labels: list[str], section: str, company_context: dict) -> str | None:
+    """
+    FIX (P0 -- "DIN everywhere" bug): the previous version fuzzy-matched
+    `section_name + " " + label` against `section_name + " " + leaf_key` for every
+    candidate. Because every field in the same section shares those section-name
+    tokens on both sides, token_set_ratio scores were dominated by the shared
+    boilerplate rather than the actual field text -- a short, generic leaf like
+    "DIN" ends up looking MORE similar to almost any query in its section than the
+    actually-correct field does (empirically: DIN scored 90.5 vs. Company Name's
+    85.7 for the query "name of the firm"). The fix: never blend the section name
+    into the scored strings. Section is used only to decide which section's fields
+    to search FIRST (an ordering hint), never as text that inflates the score. A
+    length-aware threshold also guards against short candidate strings (like "DIN",
+    "PAN", "GST") winning on fuzzy noise alone -- short candidates now require a
+    near-exact match, not just a generically "similar-length" one.
+    """
     try:
         from rapidfuzz import fuzz
     except Exception:
@@ -609,25 +644,29 @@ def _match_company_context_value(labels: list[str], section: str, company_contex
     def norm(text: str) -> str:
         return re.sub(r'[^a-z0-9]+', ' ', str(text or '').lower()).strip()
 
-    query = norm(" ".join([section] + [str(label) for label in labels if label]))
+    # Query is built ONLY from the actual label text -- never include the section name here.
+    query = norm(" ".join([str(label) for label in labels if label]))
     if not query:
         return None
 
-    def iter_leaves(value, path: str = ""):
+    def iter_leaves(value, key_path: str = ""):
+        """Yields (leaf_key_text, leaf_value) pairs. key_path tracks only the
+        immediate leaf key (e.g. 'DIN'), never accumulates the section name, so the
+        candidate string fuzzy-matched against `query` is just the field's own label."""
         if isinstance(value, dict):
             for key, nested in value.items():
-                next_path = f"{path} {key}".strip()
-                yield from iter_leaves(nested, next_path)
+                yield from iter_leaves(nested, key)
         elif isinstance(value, list):
             for item in value:
-                yield from iter_leaves(item, path)
+                yield from iter_leaves(item, key_path)
         else:
             leaf_value = str(value or "").strip()
             if leaf_value:
-                yield path, leaf_value
+                yield key_path, leaf_value
 
     best_value = None
     best_score = 0
+    second_best_score = 0
     section_order = []
     if section and section in company_context:
         section_order.append(section)
@@ -635,23 +674,42 @@ def _match_company_context_value(labels: list[str], section: str, company_contex
 
     for section_name in section_order:
         section_data = company_context.get(section_name)
-        for path, leaf_value in iter_leaves(section_data, section_name):
-            candidate = norm(path)
+        for leaf_key, leaf_value in iter_leaves(section_data, ""):
+            candidate = norm(leaf_key)
             if not candidate:
                 continue
             score = fuzz.token_set_ratio(query, candidate) if fuzz else (100 if candidate in query or query in candidate else 0)
-            leaf_norm = norm(leaf_value)
-            if leaf_norm and (leaf_norm in query or query in leaf_norm):
-                score += 10
-            if section_name and norm(section_name) in query:
-                score += 5
-            if score > best_score:
-                best_score = score
-                best_value = leaf_value
 
-    if best_score >= 80:
-        return best_value
-    return None
+            # Length-aware guard: short candidate strings (<=2 tokens after
+            # normalization, e.g. "din", "pan no", "gst") are exactly where fuzzy
+            # scoring breaks down -- require them to be near-exact, not just
+            # superficially similar in length/shared words.
+            candidate_tokens = candidate.split()
+            required = 92 if len(candidate_tokens) <= 2 else 84
+
+            if score >= required:
+                if score > best_score:
+                    second_best_score = best_score
+                    best_score = score
+                    best_value = leaf_value
+                elif score > second_best_score and leaf_value != best_value:
+                    second_best_score = score
+
+        # If we already found a strong match in the section the field actually
+        # belongs to, don't let a later section's coincidental match override it.
+        if section_name == section and best_value is not None:
+            break
+
+    # FIX (P1 -- ambiguous generic queries like bare "Name"): if a second, DIFFERENT
+    # candidate scored nearly as well as the winner, this query is genuinely
+    # ambiguous (e.g. "Name" alone could mean "Company Name" or "Contact Person
+    # Name") -- refuse to guess. Leaving it blank for GPT-4o vision (which has
+    # visual/positional context this deterministic layer doesn't) is safer than
+    # confidently answering with a coin-flip.
+    if best_value is not None and (best_score - second_best_score) < 8:
+        return None
+
+    return best_value
 
 def _find_libreoffice() -> str:
     import shutil as _shutil, platform, glob
@@ -1066,10 +1124,30 @@ def ai_fill_workbook(
                     if not is_allowed_col(coord):
                         continue
                     field_context = fields_by_cell.get(coord, {})
-                    context_labels = list(dict.fromkeys(
+
+                    # FIX (P0 -- "DIN everywhere" bug, path 2): the section name used
+                    # to be smuggled into context_labels itself (not just passed as
+                    # the separate `section` arg), which re-contaminates the fuzzy
+                    # query even after _match_company_context_value stopped
+                    # concatenating `section` internally. Also strip any residual
+                    # "--- Section: ... ---" banner text that can leak in via
+                    # row_context when a fillable cell shares a row with a header.
+                    def _clean_context_text(v):
+                        s = str(v or "").strip()
+                        if not s or (s.startswith("--- Section:") and s.endswith("---")):
+                            return ""
+                        return s
+
+                    raw_context_labels = (
                         labels +
                         field_context.get("labels", []) +
-                        [field_context.get("row_context", ""), field_context.get("section", "")]
+                        [field_context.get("row_context", "")]
+                        # NOTE: field_context["section"] is deliberately NOT included
+                        # here -- it's passed separately as `section` below, used only
+                        # for search ordering, never blended into the matched text.
+                    )
+                    context_labels = list(dict.fromkeys(
+                        cleaned for cleaned in (_clean_context_text(l) for l in raw_context_labels) if cleaned
                     ))
                     section = field_context.get("section", "")
 

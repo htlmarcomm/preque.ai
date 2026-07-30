@@ -138,10 +138,34 @@ def extract_candidates_from_map(cell_map: str, max_hops: int = 4) -> Dict[str, L
             name = chr(65 + rem) + name
         return name
 
+    ROMAN_HEADING_RE = re.compile(r'^[IVXLCDM]{1,4}\s*[\.\)\-:]')
+
     def is_usable_label(val: str) -> bool:
         if not val or val == "EMPTY":
             return False
-        return val.strip().lower() not in STOP_LABELS
+        s = val.strip()
+        # FIX (P0 -- section headers getting overwritten): build_sheet_cell_map now
+        # wraps detected section headers as "--- Section: <name> ---" in the map so
+        # GPT-4o vision can use them for navigation. But that wrapper text is a
+        # structural marker, not a real field label -- if it were ever used as the
+        # "nearby label" for an adjacent blank cell, Pass 1 or the context matcher
+        # could match on it and overwrite the header's own cell. Never treat it as
+        # a usable label.
+        if s.startswith("--- Section:") and s.endswith("---"):
+            return False
+        # Not every heading gets wrapped as a "--- Section: ... ---" marker -- only
+        # ones detected via a horizontal cell merge. A heading like
+        # "V. QUALITY CERTIFICATION/AUTHORIZATION/LICENSE AVAILABLE" that happens to
+        # sit in a single unmerged cell slips through that check, and its mention of
+        # "license"/"certification" can trip the attachment-detection heuristic for
+        # an unrelated adjacent blank cell. Catch these structurally instead: roman
+        # numeral headings, and long mostly-uppercase banner text.
+        if ROMAN_HEADING_RE.match(s):
+            return False
+        letters = [c for c in s if c.isalpha()]
+        if len(s) > 20 and letters and (sum(1 for c in letters if c.isupper()) / len(letters)) > 0.85:
+            return False
+        return s.lower() not in STOP_LABELS
 
     def find_label_left(col_idx, row):
         for hop in range(1, max_hops + 1):
