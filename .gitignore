@@ -18,3 +18,4 @@ backend/google-credentials.json
 *credentials*.json
 *.pem
 *.key
+backend/static/

@@ -1,8 +1,10 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+import os
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from routers import company_data, company_search, forms, documents, agent, project_files, workspace, google, search, subcontractors, project_data, project_picker
 from models.database import engine, Base
 from auth import require_api_key
@@ -41,6 +43,52 @@ app.include_router(subcontractors.router, prefix="/api/subcontractors", tags=["S
 app.include_router(project_data.router, prefix="/api/project-data", tags=["Project Data"], dependencies=api_auth)
 app.include_router(project_picker.router, prefix="/api/project-picker", tags=["Project Picker"], dependencies=api_auth)
 
-@app.get("/")
-def root():
+# Always available, unauthenticated (registered directly on `app`, not
+# through one of the api_auth-gated routers above) -- this is what the
+# Docker HEALTHCHECK and any platform health-checker actually probes, and
+# it works whether or not a built frontend is bundled.
+@app.get("/api/health")
+def health():
     return {"status": "PreQue Automation API running"}
+
+
+# Serve the built frontend (frontend/dist, copied to backend/static in the
+# Docker image) from the same origin as the API in production. This is
+# entirely optional -- in local dev, backend/static doesn't exist, so none
+# of this registers and the Vite dev server on :5173 is used instead, as
+# before. Registered LAST so it can never shadow an /api/* route: FastAPI
+# matches routes in registration order, and every router above was already
+# added by this point.
+FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "static")
+
+if os.path.isdir(FRONTEND_DIST):
+    # FIX (found by actually testing this, not just reading it): a plain
+    # `@app.get("/")` health-check endpoint used to live where this block
+    # is now. Since it was registered before this catch-all, it permanently
+    # shadowed "/" -- visiting the deployed app's root URL showed raw JSON
+    # instead of the React app. Moved that check to /api/health above so
+    # "/" is free for the SPA to actually own here.
+    @app.get("/{full_path:path}")
+    def serve_spa(full_path: str):
+        index_path = os.path.join(FRONTEND_DIST, "index.html")
+        if not full_path:
+            return FileResponse(index_path)
+        # Path traversal guard: resolve and confirm the requested file is
+        # still inside FRONTEND_DIST before ever serving it -- full_path
+        # comes straight from the URL and a request like
+        # "/../../backend/.env" would otherwise walk right out of the
+        # intended static directory.
+        candidate = os.path.normpath(os.path.join(FRONTEND_DIST, full_path))
+        if os.path.commonpath([candidate, FRONTEND_DIST]) == FRONTEND_DIST and os.path.isfile(candidate):
+            return FileResponse(candidate)
+        # Any other unmatched path (a client-side route like /history,
+        # /company, etc.) falls back to index.html so React Router can
+        # handle it -- this is the standard SPA-hosting pattern.
+        return FileResponse(index_path)
+else:
+    # No frontend bundled (e.g. plain local dev, `uvicorn main:app` without
+    # having built into backend/static) -- keep "/" answering with a plain
+    # status so hitting the bare API root isn't just a 404.
+    @app.get("/")
+    def root():
+        return {"status": "PreQue Automation API running"}

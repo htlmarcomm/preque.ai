@@ -1,0 +1,16 @@
+# Never bake real secrets or an entire pre-built venv into the image.
+backend/.env
+backend/venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/preque.db
+backend/uploads/
+backend/seed_data/
+backend/google-credentials.json
+
+frontend/.env
+frontend/node_modules/
+frontend/dist/
+
+.git/
+*.md

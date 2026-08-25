@@ -1,7 +1,13 @@
 import axios from 'axios'
 
+// Local dev sets VITE_API_URL explicitly (frontend/.env) to point at the
+// separate backend dev server on :8000. In production the built frontend is
+// served by the backend itself from the same origin (see backend/main.py),
+// so an unset VITE_API_URL falls back to '' -- a relative baseURL, meaning
+// requests go to whatever origin the page was actually loaded from, with no
+// URL to hardcode or get wrong at build time.
 export const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000',
+  baseURL: import.meta.env.VITE_API_URL || '',
   timeout: 60000, // 60s default timeout
   headers: import.meta.env.VITE_API_KEY ? { 'X-API-Key': import.meta.env.VITE_API_KEY } : {},
 })
