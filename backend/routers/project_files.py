@@ -8,6 +8,7 @@ import openpyxl, io, os, json, logging
 from datetime import datetime
 from services.doc_extractor import extract_text, chunk_text
 from services.vector_store import VectorStore
+from utils import sanitize_filename
 
 router = APIRouter()
 FILES_DIR = "uploads/project_files"
@@ -105,7 +106,7 @@ async def upload_file(
     row_count  = 0
     dest = None
     if file:
-        safe = file.filename.replace(" ", "_")
+        safe = sanitize_filename(file.filename)
         dest = os.path.join(FILES_DIR, safe)
         contents = await file.read()
         with open(dest, "wb") as f:

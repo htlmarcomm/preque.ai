@@ -51,7 +51,7 @@ def _extract_pdf(filepath: str) -> List[Dict[str, str]]:
 def _extract_pdf_vision(filepath: str) -> List[Dict[str, str]]:
     import tempfile, shutil, base64
     from pdf2image import convert_from_path
-    from routers.forms import openai_client
+    from routers.forms import openai_client, VISION_MODEL
     
     results = []
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
@@ -72,15 +72,16 @@ def _extract_pdf_vision(filepath: str) -> List[Dict[str, str]]:
             
             try:
                 resp = openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
+                    model=VISION_MODEL,  # this is a vision call (image transcription), needs the full model not the lite one
                     messages=[
                         {"role": "system", "content": prompt},
                         {
-                            "role": "user", 
+                            "role": "user",
                             "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"}}]
                         }
                     ],
-                    max_tokens=4000
+                    max_tokens=16000,  # generous headroom for Gemini 3.x's internal reasoning overhead
+                    reasoning_effort="low",
                 )
                 text = resp.choices[0].message.content.strip()
                 if text:

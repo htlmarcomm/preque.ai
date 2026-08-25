@@ -5,6 +5,7 @@ from models.database import get_db, FilledForm
 from openai import OpenAI
 import openpyxl, io, os, json, re, base64, tempfile, subprocess, shutil
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from routers.project_files import read_excel_preview
 
 router = APIRouter()
@@ -15,26 +16,20 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 openai_client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
-    base_url="https://models.inference.ai.azure.com",
+    # FIX (live bug -- every single AI call was 404ing): GitHub Models (the
+    # original free provider this app was built on) was fully retired by
+    # GitHub on 2026-07-30 -- not just moved, permanently shut down. Switched
+    # to Google's Gemini API via its OpenAI-compatible endpoint instead: same
+    # `openai` SDK calling convention (so none of the prompt/parsing code
+    # needed to change), a genuinely free tier (no card required), and a much
+    # higher free quota (1,500 req/day vs GitHub Models' old 50/day).
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    timeout=120.0,  # 2 min per API call
 )
-VISION_MODEL = "gpt-4o"
+VISION_MODEL = "gemini-3.5-flash"
+MINI_MODEL = "gemini-3.5-flash-lite"  # cheaper/faster text-only model for classification-style calls
 
 # â”€â”€ Prompts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-SHEET_CLASSIFY_PROMPT = """You are looking at ONE sheet/tab from a multi-sheet Excel Pre-Qualification form for HTL Aircon Pvt Ltd, a MEP contractor.
-
-The sheet name is: "{sheet_name}"
-
-Below is the cell map for JUST this sheet:
-{cell_map}
-
-Decide what kind of sheet this is:
-
-1. "FILLABLE" — it has labelled fields/questions (with or without sub-headings) that need company data filled into adjacent/nearby empty cells. This includes forms with a heading followed by sub-fields (e.g. "Annual Turnover" as heading, then "2022-23", "2023-24" as sub-rows each needing a value).
-2. "INFO_ONLY" — it is pure instructional text, a cover letter, declaration, index/table of contents, terms & conditions, or auto-calculated/summary sheet with no genuine blank answer cells belonging to HTL (e.g. project background text, an "Instructions to Bidders" page, or a sheet that is entirely a client-side summary/recommendation table with no HTL input required).
-
-Respond with ONLY one word: FILLABLE or INFO_ONLY"""
-
 
 FILL_SYSTEM_PROMPT = """You are an expert form filler working for HTL Aircon Pvt Ltd, a MEP contractor.
 
@@ -65,75 +60,76 @@ Rules:
 - Do NOT fill cells that are clearly informational text, instructions, or declarations with no blank to answer
 - Return ONLY the JSON, no markdown, no explanation"""
 
-COLUMN_CLASSIFY_PROMPT = """Analyze this Excel cell map for a sheet named '{sheet_name}'.
-Some forms have specific columns reserved for the vendor to fill in, while other columns are strictly for the client's internal use (like "remarks by evaluator", "docs verified", "internal use only", etc.).
+# FIX (P1 -- 50 req/day quota risk): this used to be three separate GPT-4o-mini
+# calls per sheet (classify, column-policy, table-detect). GitHub Models' free
+# tier caps at 50 requests/day, so a single multi-sheet form (e.g. 13 tabs)
+# could burn the *entire* daily quota on classification alone, before a single
+# vision-fill call ever ran. Combining all three questions into one call per
+# sheet cuts that to a flat 1 call/sheet regardless of how many of the three
+# questions are actually relevant.
+SHEET_ANALYSIS_PROMPT = """You are analyzing ONE sheet/tab from a multi-sheet Excel Pre-Qualification form for HTL Aircon Pvt Ltd, a MEP contractor.
 
-Look at the header rows (usually row 1 to 5).
-Determine which columns are meant for us (the vendor filling the form) versus which are strictly reserved for the client/evaluator.
-If there is no clear distinction, or all columns seem fillable, just return empty lists.
+The sheet name is: "{sheet_name}"
 
-Return a JSON object with this exact structure:
-{{
-  "fillable_columns": ["B", "D"],
-  "reserved_columns": ["E", "F", "G"]
-}}
-
-CELL MAP:
+Below is the cell map for JUST this sheet:
 {cell_map}
-"""
 
-TABLE_DETECT_PROMPT = """Analyze this Excel cell map for a sheet named '{sheet_name}'.
-Determine if this sheet contains a repeating table where each row represents ONE PROJECT
-(a list of client engagements/jobs). This includes two distinct kinds of tables:
+Answer THREE questions about this sheet and return a single JSON object.
 
-TYPE "project_reference": each row asks for CLIENT CONTACT/REFERENCE details tied to a
-past project — columns like client name, contact person, designation, phone, email — used
-so a form reviewer can call a past client for a reference.
+1. "classification": either
+   - "FILLABLE" — it has labelled fields/questions (with or without sub-headings) that need
+     company data filled into adjacent/nearby empty cells. This includes a heading followed
+     by sub-fields (e.g. "Annual Turnover" as heading, then "2022-23", "2023-24" as sub-rows
+     each needing a value).
+   - "INFO_ONLY" — pure instructional text, a cover letter, declaration, index/table of
+     contents, terms & conditions, or auto-calculated/summary sheet with no genuine blank
+     answer cells belonging to HTL.
 
-TYPE "project_details": each row asks for PROJECT-level facts — project name, location,
-client name, area, contract value/amount, start/completion dates, "scope of work". If the table asks for project value, scope, duration, or area, classify it as "project_details" (Major Work) even if it ALSO asks for a client contact person.
+2. "columns": some forms reserve specific columns for the client's internal use only (e.g.
+   "remarks by evaluator", "docs verified", "internal use only") versus columns meant for us
+   (the vendor) to fill. Look at the header rows (usually row 1 to 5). If there's no clear
+   distinction, or all columns seem fillable, return empty lists for both:
+   {{"fillable_columns": ["B", "D"], "reserved_columns": ["E", "F", "G"]}}
 
-CRITICAL: The form might use different terminology instead of "Projects" or "References". 
-Look for headers or preceding text like:
-- "Major work done"
-- "Ongoing projects"
-- "Projects completed"
-- "Past performance"
-- "Experience Record"
-If the table asks for details like "Project Cost", "Duration of Project", "Scope of Work", "Location", "Client Name", treat it as a project table regardless of the exact heading.
+3. "project_table": does this sheet contain a repeating table where each row represents ONE
+   PROJECT (a list of client engagements/jobs)? Two distinct kinds:
+   - TYPE "project_reference": each row asks for CLIENT CONTACT/REFERENCE details tied to a
+     past project — client name, contact person, designation, phone, email — used so a
+     reviewer can call a past client for a reference.
+   - TYPE "project_details": each row asks for PROJECT-level facts — project name, location,
+     client name, area, contract value/amount, start/completion dates, scope of work. If the
+     table asks for project value, scope, duration, or area, classify as "project_details"
+     even if it ALSO asks for a client contact person.
+   The form might use different terminology instead of "Projects" or "References" — look for
+   headers or preceding text like "Major work done", "Ongoing projects", "Projects completed",
+   "Past performance", "Experience Record". If it asks for "Project Cost", "Duration of
+   Project", "Scope of Work", "Location", "Client Name", treat it as a project table
+   regardless of the exact heading. Look for consecutive numbered cells in a single column
+   (e.g. [C7]='1', [C8]='2') indicating table rows, or clear repeating column headers. Also
+   scan nearby text for an explicit max row count instruction (e.g. "list only 10 projects at
+   max", "top 5 projects", "maximum 3 references") — extract that number if present, else null.
+   If not a project table, just return {{"is_project_table": false}}.
 
-Look for consecutive numbered cells in a single column (e.g. [C7]='1', [C8]='2') indicating
-table rows, or clear repeating column headers suggesting a project list.
-
-Also scan any nearby text (instructions, headings, notes near the table) for an explicit
-maximum row count instruction, e.g. "list only 10 projects at max", "top 5 projects",
-"maximum 3 references" — extract that number if present, else null.
-
-Return JSON:
+Return ONLY this JSON object, no markdown, no explanation:
 {{
-  "is_project_table": true,
-  "table_type": "project_reference" | "project_details",
-  "subheading": "The exact heading text found (e.g. 'Major work done', 'Past Experience'), or null",
-  "start_row": 7,
-  "max_rows": 10,
-  "mapping": {{
-    "project_name": "D",
-    "client_name": "E",
-    "location": "F",
-    "area_sqft": "G",
-    "amount": "H",
-    "start_date": "I",
-    "completion_date": "J",
-    "contact_name": "K",
-    "contact_designation": "L",
-    "contact_phone": "M",
-    "contact_email": "N",
-    "scope_of_work": "O"
+  "classification": "FILLABLE",
+  "columns": {{"fillable_columns": [], "reserved_columns": []}},
+  "project_table": {{
+    "is_project_table": true,
+    "table_type": "project_reference",
+    "subheading": "The exact heading text found (e.g. 'Major work done'), or null",
+    "start_row": 7,
+    "max_rows": 10,
+    "mapping": {{
+      "project_name": "D", "client_name": "E", "location": "F", "area_sqft": "G",
+      "amount": "H", "start_date": "I", "completion_date": "J", "contact_name": "K",
+      "contact_designation": "L", "contact_phone": "M", "contact_email": "N",
+      "scope_of_work": "O"
+    }}
   }}
 }}
 Only include mapping keys for columns that actually exist as headers in this sheet — do not
 invent columns. Map any column asking for "Scope of Work" to the "scope_of_work" key.
-If not a project table, return {"is_project_table": false}.
 
 CELL MAP:
 {cell_map}
@@ -174,6 +170,79 @@ def _merge_continuation_cells(ws) -> set:
     return continuations
 
 
+def _print_area_bounds(ws):
+    """
+    Returns (min_row, min_col, max_row, max_col) for the sheet's own defined
+    print area, or None if it has none / it can't be parsed.
+
+    FIX (P0 -- duplicate answers written into cells that were never meant to
+    hold one): a form template can have stray extra blank columns sitting
+    right next to the real answer column (e.g. a leftover draft column, or
+    padding) that the template's own author explicitly excluded from
+    print_area when they set it up. Pass 1 (deterministic matching) usually
+    lands correctly in the real answer column since it's the FIRST empty
+    cell found scanning outward, but GPT-4o vision looks at the rendered
+    image and cell map together and, seeing another nearby EMPTY cell for
+    the same visible field, would reasonably (if wrongly) fill that one too
+    -- producing two slightly different values for what's really one
+    answer. The template's own print_area is a strong, unambiguous signal
+    for "this is the real submitted content" that was already sitting in
+    the file, unused. Cells outside it are excluded from being offered as
+    fillable at all.
+    """
+    from openpyxl.utils.cell import range_boundaries
+    pa = getattr(ws, "print_area", None)
+    if not pa:
+        return None
+    try:
+        first_range = str(pa).split(',')[0].strip()
+        if '!' in first_range:
+            first_range = first_range.split('!', 1)[1]
+        first_range = first_range.replace('$', '')
+        min_col, min_row, max_col, max_row = range_boundaries(first_range)
+        if None in (min_col, min_row, max_col, max_row):
+            return None
+        return (min_row, min_col, max_row, max_col)
+    except Exception:
+        return None
+
+
+def _serial_number_columns(filled_cells: dict) -> set:
+    """
+    Detects columns that are pure sequential serial-number/index columns
+    (e.g. column A holding 1, 2, 3, 4, 5... to mark numbered sections) so
+    their EMPTY cells never get offered up as fillable answer slots.
+
+    FIX (P0 -- real data written into an index column): the row-context
+    matching used for Pass 1 doesn't care which column an empty cell sits
+    in -- it just sees "this row's text says Mobile No." and fuzzy-matches
+    that against any empty cell in the row, including the index/serial
+    column itself if that happens to be blank on this particular sub-row.
+    That silently overwrote what should stay a plain row number with real
+    company data (e.g. a phone number landing in the "Sr. No." column).
+    """
+    by_col: dict = {}
+    for (r, c), val in filled_cells.items():
+        by_col.setdefault(c, []).append((r, val))
+
+    serial_cols = set()
+    for c, entries in by_col.items():
+        if len(entries) < 3:
+            continue
+        entries.sort()
+        nums = []
+        ok = True
+        for r, val in entries:
+            if re.fullmatch(r'\d{1,3}', val.strip()):
+                nums.append(int(val))
+            else:
+                ok = False
+                break
+        if ok and nums == sorted(nums) and len(set(nums)) == len(nums) and (nums[-1] - nums[0]) < len(nums) * 3:
+            serial_cols.add(c)
+    return serial_cols
+
+
 def build_sheet_cell_map(ws, ws_formulas=None) -> tuple[str, set[str]]:
     """Build a compact cell map for a single worksheet, only including cells with values and adjacent empty cells.
     Returns (cell_map_str, protected_cells_set)."""
@@ -182,6 +251,7 @@ def build_sheet_cell_map(ws, ws_formulas=None) -> tuple[str, set[str]]:
     real_max_r = 0
     real_max_c = 0
     merge_continuations = _merge_continuation_cells(ws)
+    print_bounds = _print_area_bounds(ws)
 
     if ws_formulas:
         for v_row, f_row in zip(ws.iter_rows(), ws_formulas.iter_rows()):
@@ -209,6 +279,8 @@ def build_sheet_cell_map(ws, ws_formulas=None) -> tuple[str, set[str]]:
     max_r = min(ws.max_row, real_max_r + 2)
     max_c = min(ws.max_column, real_max_c + 2)
 
+    serial_cols = _serial_number_columns(filled_cells)
+
     # Detect horizontal merged cells as potential section headers
     section_headers = {}
     for merged_range in ws.merged_cells.ranges:
@@ -218,17 +290,25 @@ def build_sheet_cell_map(ws, ws_formulas=None) -> tuple[str, set[str]]:
                 text_val = filled_cells[(min_row, min_col)]
                 if len(text_val) < 150:
                     section_headers[(min_row, min_col)] = text_val
-        
+
     relevant_empty = set()
     for (r, c) in filled_cells.keys():
         for dr in range(-2, 3):
             for dc in range(-2, 3):
                 nr, nc = r + dr, c + dc
                 if 1 <= nr <= max_r and 1 <= nc <= max_c:
-                    # FIX: never surface a merge-continuation cell as "EMPTY" -- see
-                    # _merge_continuation_cells docstring above.
-                    if (nr, nc) not in filled_cells and (nr, nc) not in merge_continuations:
-                        relevant_empty.add((nr, nc))
+                    # FIX: never surface a merge-continuation cell, a cell
+                    # outside the sheet's own print area, or a cell in a
+                    # detected serial-number column as "EMPTY" -- see the
+                    # docstrings on _merge_continuation_cells,
+                    # _print_area_bounds, and _serial_number_columns above.
+                    if (nr, nc) in filled_cells or (nr, nc) in merge_continuations:
+                        continue
+                    if print_bounds and not (print_bounds[0] <= nr <= print_bounds[2] and print_bounds[1] <= nc <= print_bounds[3]):
+                        continue
+                    if nc in serial_cols:
+                        continue
+                    relevant_empty.add((nr, nc))
                         
     rows_to_output = set(r for r, c in filled_cells.keys()) | set(r for r, c in relevant_empty)
     
@@ -257,7 +337,7 @@ def build_sheet_cell_map(ws, ws_formulas=None) -> tuple[str, set[str]]:
 # ──── Deterministic vertical-block repeating-table detector (no AI call needed) ────
 
 FIELD_KEYWORDS = {
-    "client_name": ["client name", "client referance", "client reference", "customer name"],
+    "client_name": ["client name", "client referance", "client reference", "customer name", "end user"],
     "project_name": ["project name", "name of project"],
     "location": ["location"],
     "area_sqft": ["area (sqft)", "area sqft", "area"],
@@ -280,6 +360,122 @@ def _guess_field_key(sub_label: str):
             if kw in low:
                 return key
     return None
+
+
+def find_field_value_in_record(rec_data: dict, field_key: str, column_labels: dict | None = None) -> str | None:
+    """
+    Given one imported project-data row (rec_data: {normalized_column_key: value})
+    find the value for a canonical field like "contact_name" or "project_name",
+    even when the source spreadsheet's own column header uses completely
+    different wording (real imports are inconsistent -- "Client" vs "Client
+    Name" vs "NAME OF CLIENT" vs "Party Name", or a single merged column like
+    "Contact reference (Name / Organisation / Email ID / Phone Number)").
+
+    FIX (P0 -- project-detail table cells silently staying blank): the
+    previous version matched a short hardcoded keyword list as a plain
+    substring against the normalized snake_case column KEY (e.g. "client" in
+    "client_name"), and for several fields -- client_name, project_name,
+    contact_name, contact_designation, contact_phone, contact_email -- there
+    was no keyword list at all, so it fell back to literally requiring the
+    key to contain the field name itself (e.g. "client_name" in "client_name")
+    -- which only matches a source column already named almost exactly that.
+    Any other real-world header ("Client", "Customer", "NAME OF CLIENT")
+    silently produced no value, even though a project WAS selected and DID
+    have the data. This scores every column's REAL display label (via
+    `column_labels`, sourced from ProjectDataColumn -- falls back to a
+    prettified version of the key if not available) against the field's known
+    phrasings (FIELD_KEYWORDS) with the same fuzzy matcher used everywhere
+    else in this codebase, instead of requiring an exact substring hit.
+    """
+    try:
+        from rapidfuzz import fuzz
+    except ImportError:
+        fuzz = None
+
+    keywords = FIELD_KEYWORDS.get(field_key, [field_key.replace("_", " ")])
+
+    def norm(s):
+        return re.sub(r'[^a-z0-9]+', ' ', str(s or '').lower()).strip()
+
+    normalized_keywords = [norm(kw) for kw in keywords]
+
+    best_value, best_score, second_best_score = None, 0, 0
+    for col_key, value in (rec_data or {}).items():
+        if not value or not isinstance(value, str) or not value.strip():
+            continue
+        label = (column_labels or {}).get(col_key) or col_key.replace('_', ' ')
+        candidate = norm(label)
+        if not candidate:
+            continue
+
+        if fuzz:
+            score = max(fuzz.token_set_ratio(kw, candidate) for kw in normalized_keywords)
+        else:
+            score = 100 if any(kw in candidate or candidate in kw for kw in normalized_keywords) else 0
+
+        # Length-aware guard (same pattern as _match_company_context_value):
+        # short candidate labels (<=2 tokens, e.g. "Project Name") are exactly
+        # where token_set_ratio breaks down -- a keyword phrase sharing just
+        # ONE generic word ("project value" vs "project name" scores 80) can
+        # still clear a flat threshold, so short candidates require a
+        # near-exact match instead of a merely-similar one.
+        candidate_tokens = candidate.split()
+        required = 92 if len(candidate_tokens) <= 2 else 82
+
+        if score >= required:
+            value_clean = value.strip()
+            if score > best_score:
+                second_best_score = best_score
+                best_score = score
+                best_value = value_clean
+            elif score > second_best_score and value_clean != best_value:
+                second_best_score = score
+
+    # Ambiguity guard: if a second, different column scored nearly as well as
+    # the winner, this is a coin flip -- refuse to guess rather than risk
+    # filling the wrong data into the form.
+    if best_value is not None and (best_score - second_best_score) < 8:
+        return None
+
+    if best_value:
+        return best_value
+
+    # FIX: many real project trackers record Start Date / End Date but never
+    # a separate "Duration" figure -- rather than leave it blank when those
+    # two dates ARE present and parseable, compute it.
+    if field_key == "duration":
+        return _compute_duration_from_dates(rec_data, column_labels)
+
+    return None
+
+
+def _compute_duration_from_dates(rec_data: dict, column_labels: dict | None = None) -> str | None:
+    """Fallback for a missing "duration" column: derive it from whichever
+    columns best match start_date/completion_date instead. Returns e.g.
+    "13 months" or "18 days", or None if either date is missing/unparsable."""
+    start_val = find_field_value_in_record(rec_data, "start_date", column_labels)
+    end_val = find_field_value_in_record(rec_data, "completion_date", column_labels)
+    if not start_val or not end_val:
+        return None
+
+    def parse(s):
+        s = str(s).strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y"):
+            try:
+                return datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        return None
+
+    start_dt, end_dt = parse(start_val), parse(end_val)
+    if not start_dt or not end_dt or end_dt < start_dt:
+        return None
+
+    days = (end_dt - start_dt).days
+    months = round(days / 30.44)
+    if months >= 1:
+        return f"{months} month{'s' if months != 1 else ''}"
+    return f"{days} day{'s' if days != 1 else ''}"
 
 
 def _col_letter(idx: int) -> str:
@@ -802,76 +998,62 @@ def excel_to_images_per_sheet(file_bytes: bytes, filename: str) -> tuple[dict, s
     return images_by_sheet, tmpdir
 
 
-def classify_sheet(sheet_name: str, cell_map: str) -> str:
-    """Ask GPT-4o (text-only, cheap) whether a sheet needs filling or is informational."""
-    if not cell_map.strip():
-        return "INFO_ONLY"
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=10,
-            messages=[{
-                "role": "user",
-                "content": SHEET_CLASSIFY_PROMPT.format(
-                    sheet_name=sheet_name,
-                    cell_map=cell_map[:6000]  # keep classification call cheap
-                )
-            }]
-        )
-        raw = response.choices[0].message.content.strip().upper()
-        return "FILLABLE" if "FILLABLE" in raw else "INFO_ONLY"
-    except Exception as e:
-        print(f"[WARN] Classification failed for '{sheet_name}': {e} — defaulting to FILLABLE")
-        return "FILLABLE"
+def _default_sheet_analysis() -> dict:
+    return {
+        "classification": "FILLABLE",
+        "fillable_columns": [],
+        "reserved_columns": [],
+        "table_info": {"is_project_table": False},
+    }
 
 
-def classify_sheet_columns(sheet_name: str, cell_map: str) -> tuple[list[str], list[str]]:
-    """Ask GPT-4o to identify which columns are for internal client use vs vendor use."""
+def analyze_sheet(sheet_name: str, cell_map: str) -> dict:
+    """
+    Single GPT-4o-mini call answering all three per-sheet questions that used to
+    be three separate round trips (classification, column policy, project-table
+    detection) -- see the FIX note above SHEET_ANALYSIS_PROMPT. Returns:
+    {"classification": "FILLABLE"|"INFO_ONLY", "fillable_columns": [...],
+     "reserved_columns": [...], "table_info": {...}}
+    On any failure, falls back to the same safe defaults the three separate
+    functions used to return individually (FILLABLE, no column restriction,
+    not a project table) so a flaky call degrades gracefully instead of
+    silently dropping a sheet.
+    """
     if not cell_map.strip():
-        return [], []
+        return {**_default_sheet_analysis(), "classification": "INFO_ONLY"}
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=150,
+            model=MINI_MODEL,
+            # Gemini 3.x models can't have internal "thinking" disabled and
+            # spend part of the token budget on it before emitting the
+            # visible JSON -- reasoning_effort="low" keeps that spend down for
+            # what's a mechanical classification task, and max_tokens is
+            # generous so a bigger-than-expected reasoning pass still leaves
+            # room for the actual JSON instead of truncating it mid-string.
+            max_tokens=8000,
+            reasoning_effort="low",
             response_format={"type": "json_object"},
             messages=[{
                 "role": "user",
-                "content": COLUMN_CLASSIFY_PROMPT.format(
+                "content": SHEET_ANALYSIS_PROMPT.format(
                     sheet_name=sheet_name,
-                    cell_map=cell_map[:6000]
+                    cell_map=cell_map[:6000]  # keep the call cheap
                 )
             }]
         )
         raw = response.choices[0].message.content.strip()
         data = json.loads(raw)
-        return data.get("fillable_columns", []), data.get("reserved_columns", [])
+        classification = str(data.get("classification", "FILLABLE")).strip().upper()
+        columns = data.get("columns") or {}
+        return {
+            "classification": "FILLABLE" if classification != "INFO_ONLY" else "INFO_ONLY",
+            "fillable_columns": columns.get("fillable_columns", []),
+            "reserved_columns": columns.get("reserved_columns", []),
+            "table_info": data.get("project_table") or {"is_project_table": False},
+        }
     except Exception as e:
-        print(f"[WARN] Column classification failed for '{sheet_name}': {e} — defaulting to all columns fillable")
-        return [], []
-
-
-def detect_repeating_table(sheet_name: str, cell_map: str) -> dict:
-    """Ask GPT-4o-mini if this sheet is a repeating table (like Project History)."""
-    if not cell_map.strip():
-        return {"is_project_table": False}
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=200,
-            response_format={"type": "json_object"},
-            messages=[{
-                "role": "user",
-                "content": TABLE_DETECT_PROMPT.format(
-                    sheet_name=sheet_name,
-                    cell_map=cell_map[:6000]
-                )
-            }]
-        )
-        raw = response.choices[0].message.content.strip()
-        return json.loads(raw)
-    except Exception as e:
-        print(f"[WARN] Table detection failed for '{sheet_name}': {e}")
-        return {"is_project_table": False}
+        print(f"[WARN] Sheet analysis failed for '{sheet_name}': {e} — defaulting to FILLABLE / no column restriction / no project table")
+        return _default_sheet_analysis()
 
 
 
@@ -958,7 +1140,16 @@ def ai_fill_sheet(
         try:
             response = openai_client.chat.completions.create(
                 model=VISION_MODEL,
-                max_tokens=4000,
+                # A real sheet's prompt (image + full cell map + full company
+                # context JSON) triggers much heavier internal reasoning than
+                # a simple test call did -- 6000 wasn't enough and truncated
+                # mid-JSON (json.loads failing with "Unterminated string").
+                # reasoning_effort="low" keeps that reasoning pass from
+                # ballooning further, and max_tokens has real headroom so an
+                # underestimate doesn't silently cut the response off again.
+                max_tokens=24000,
+                reasoning_effort="low",
+                response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": FILL_SYSTEM_PROMPT},
                     {"role": "user", "content": content}
@@ -1017,23 +1208,44 @@ def ai_fill_workbook(
 
     sheet_status = {}
     sheet_column_policies = {}
-    fillable_sheets = []
+    sheet_table_info = {}
+
+    sheets_to_analyze = []
     for sheet_name, cmap in sheet_maps.items():
         state = sheet_states.get(sheet_name, 'visible')
         if state in ('hidden', 'veryHidden'):
-            status = 'INFO_ONLY'
+            sheet_status[sheet_name] = 'INFO_ONLY'
             print(f"[Classify] '{sheet_name}' is {state} -> skipping classification, marking INFO_ONLY")
         else:
-            status = classify_sheet(sheet_name, cmap)
-            print(f"[Classify] '{sheet_name}' -> {status}")
-            
-        sheet_status[sheet_name] = status
-        
-        if status == "FILLABLE":
-            fillable_sheets.append(sheet_name)
-            f_cols, r_cols = classify_sheet_columns(sheet_name, cmap)
-            sheet_column_policies[sheet_name] = {"fillable": f_cols, "reserved": r_cols}
-            print(f"[Classify Columns] '{sheet_name}' -> fillable: {f_cols}, reserved: {r_cols}")
+            sheets_to_analyze.append((sheet_name, cmap))
+
+    # FIX (P1 -- request-timeout / slow-UX risk): these per-sheet analysis calls
+    # are independent of each other and touch no shared DB/session state, so run
+    # them concurrently instead of one-by-one -- for a multi-tab form this turns
+    # N sequential round trips into roughly one round trip's worth of wall time.
+    if sheets_to_analyze:
+        with ThreadPoolExecutor(max_workers=min(8, len(sheets_to_analyze))) as executor:
+            future_to_sheet = {
+                executor.submit(analyze_sheet, sheet_name, cmap): sheet_name
+                for sheet_name, cmap in sheets_to_analyze
+            }
+            for future in as_completed(future_to_sheet):
+                sheet_name = future_to_sheet[future]
+                analysis = future.result()
+                status = analysis["classification"]
+                sheet_status[sheet_name] = status
+                print(f"[Classify] '{sheet_name}' -> {status}")
+                if status == "FILLABLE":
+                    sheet_column_policies[sheet_name] = {
+                        "fillable": analysis["fillable_columns"],
+                        "reserved": analysis["reserved_columns"],
+                    }
+                    sheet_table_info[sheet_name] = analysis["table_info"]
+                    print(f"[Classify Columns] '{sheet_name}' -> fillable: {analysis['fillable_columns']}, reserved: {analysis['reserved_columns']}")
+
+    # Preserve original workbook sheet order (thread completion order is
+    # nondeterministic) for all downstream processing.
+    fillable_sheets = [sn for sn in sheet_maps if sheet_status.get(sn) == "FILLABLE"]
 
     if not fillable_sheets:
         return {}, sheet_status, "", {}, {}, []
@@ -1088,7 +1300,9 @@ def ai_fill_workbook(
                         protected_cells_by_sheet[sheet_name].add(f"{vb['answer_column']}{block_start + offset}")
 
             if not vblocks:
-                table_info = normalize_detected_table_info(detect_repeating_table(sheet_name, cmap), cmap)
+                # Reuse the project-table detection already produced by the
+                # combined analyze_sheet() call above -- no second AI call needed.
+                table_info = normalize_detected_table_info(sheet_table_info.get(sheet_name, {"is_project_table": False}), cmap)
                 if table_info.get("is_project_table"):
                     print(f"  [Table Mode] '{sheet_name}' is a Project Table. Adding to pending_project_tables.")
                     start_row = table_info.get("start_row", 1)
@@ -1380,8 +1594,22 @@ def build_company_context(db) -> dict:
                 continue
             unit_str = f" {f.unit}" if f.unit else ""
             for variant_year in _fiscal_year_variants(f.fiscal_year):
-                ctx["Financial Info"].setdefault(variant_year, {})
-                ctx["Financial Info"][variant_year][f.metric_label] = f"{f.value}{unit_str}"
+                bucket = ctx["Financial Info"].setdefault(variant_year, {})
+                if not isinstance(bucket, dict):
+                    # FIX (live bug -- crashed every process-excel call): a
+                    # CompanyField can carry a plain label that happens to
+                    # collide with a fiscal-year variant string (e.g. an
+                    # imported "Financials Turnover" table stored a field
+                    # literally labeled "2023-2024"), which set
+                    # ctx["Financial Info"]["2023-2024"] to a STRING a few
+                    # lines above. setdefault() then returns that existing
+                    # string instead of a fresh dict, and item-assignment
+                    # into a string raises TypeError. Skip only this one
+                    # colliding variant -- _fiscal_year_variants() always
+                    # produces several variants per fiscal year, so the data
+                    # still reaches the GPT prompt through the others.
+                    continue
+                bucket[f.metric_label] = f"{f.value}{unit_str}"
         ctx["Financials"] = ctx["Financial Info"]
 
     for ref in references:

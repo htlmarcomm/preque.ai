@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useRef } from 'react'
+import React, { createContext, useContext, useState, useRef, useMemo } from 'react'
 
 const FillFormContext = createContext()
 
@@ -62,7 +62,13 @@ export function FillFormProvider({ children }) {
     setPdFiles([]); setPdActiveFile(null); setPdActiveSheet(null); setPdRecords(null); setPdRecordsTotal(0); setPdPage(1); setPdSearch(''); setPdFilters([]); setPdActiveFilterValues({});
   }
 
-  const value = {
+  // Memoized: this provider holds ~50 pieces of state, so rebuilding a plain
+  // object here on every render would make every consumer re-render on any
+  // single keystroke anywhere in the Fill Form flow (e.g. typing in the
+  // preview search box would re-render the whole picker table). The setters
+  // returned by useState are referentially stable, so only the *value* slots
+  // that actually changed need to be in the dependency array.
+  const value = useMemo(() => ({
     step, setStep,
     mode, setMode,
     clientName, setClientName,
@@ -102,7 +108,15 @@ export function FillFormProvider({ children }) {
     exporting, setExporting,
     googleSheetLink, setGoogleSheetLink,
     reset
-  }
+  }), [
+    step, mode, clientName, file, dragOver, loading, result, humanAnswers,
+    savingField, savedFields, copied, error, pendingTables, activePendingIndex,
+    pickerCandidates, pickerSelectedIds, pickerSearch, pickerLoading, pickerSubmitting,
+    refRegionFilter, refStatusFilter, pdFiles, pdActiveFile, pdActiveSheet,
+    pdRecords, pdRecordsTotal, pdPage, pdSearch, pdFilters, pdActiveFilterValues,
+    pdLoadingRecords, preview, previewLoading, activeSheet, previewSearch,
+    copiedCell, exporting, googleSheetLink
+  ])
 
   return (
     <FillFormContext.Provider value={value}>

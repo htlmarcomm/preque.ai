@@ -5,7 +5,8 @@ from routers.forms import (
     ai_fill_workbook, write_filled_excel_multi,
     build_company_context, get_doc_checklist,
     openai_client, VISION_MODEL, UPLOAD_DIR,
-    excel_to_all_sheet_maps, build_workbook_form_json
+    excel_to_all_sheet_maps, build_workbook_form_json,
+    find_field_value_in_record
 )
 from typing import Optional
 import os, json, base64, re, shutil
@@ -75,8 +76,10 @@ def process_excel_form(
     5. Write values back to the exact sheet + cell they belong to
     Works for single-sheet OR multi-sheet (e.g. 13-tab) forms alike.
     """
+    from utils import sanitize_filename
+
     file_bytes = file.file.read()
-    safe_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
+    safe_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{sanitize_filename(file.filename)}"
     with open(os.path.join(UPLOAD_DIR, safe_name), "wb") as f:
         f.write(file_bytes)
 
@@ -127,7 +130,14 @@ def process_excel_form(
         for cell, value in fills.items():
             label = get_adjacent_label(cell)
             filled_data[f"{sheet_name}!{cell}"] = {
-                "label": f"{sheet_name} â€” {label}" if label else f"Cell {cell}",
+                # FIX (live bug -- garbled labels in the UI): this used to be a
+                # literal "—" em-dash, but the source file had it saved with
+                # broken encoding (mojibake bytes decoding to "â€”"), so every
+                # label shown in Review/Output rendered as garbage. Plain ASCII
+                # sidesteps the encoding issue entirely instead of just
+                # swapping in a different Unicode character that could suffer
+                # the same fate.
+                "label": f"{sheet_name} - {label}" if label else f"Cell {cell}",
                 "value": value
             }
 
@@ -136,8 +146,8 @@ def process_excel_form(
         raw_unknown = [c for c in all_empty if c not in fills]
         for c in raw_unknown:
             lbl = get_adjacent_label(c)
-            tagged = f"{sheet_name} â€” {lbl}" if lbl else f"Cell {c}"
-            if lbl and lbl != c and tagged not in [u["label"] for u in unknown_fields_objs] and lbl not in [u["label"].split(" â€” ")[-1] for u in unknown_fields_objs]:
+            tagged = f"{sheet_name} - {lbl}" if lbl else f"Cell {c}"
+            if lbl and lbl != c and tagged not in [u["label"] for u in unknown_fields_objs] and lbl not in [u["label"].split(" - ")[-1] for u in unknown_fields_objs]:
                 unknown_fields_objs.append({"label": tagged, "cell": f"{sheet_name}!{c}"})
 
     unknown_fields_objs = unknown_fields_objs[:15]
@@ -146,9 +156,9 @@ def process_excel_form(
     vs = VectorStore()
     enriched_unknown = []
     for field_obj in unknown_fields_objs:
-        # field string is usually "SheetName â€” FieldLabel"
+        # field string is usually "SheetName - FieldLabel"
         field = field_obj["label"]
-        label_only = field.split(" â€” ")[-1] if " â€” " in field else field
+        label_only = field.split(" - ")[-1] if " - " in field else field
         
         results = vs.search(db, query=label_only, top_k=3)
         suggestion = None
@@ -321,8 +331,13 @@ def save_learned_answer(
             merged = dict(form.filled_data or {})
             merged[field_label] = {"label": "Manual Answer", "value": answer}
             form.filled_data = merged
-            # Remove from unknown fields if it exists (check cell or label)
-            form.unknown_fields = [f for f in (form.unknown_fields or []) if (f.get("cell") if isinstance(f, dict) else f) != field_label]
+            # Remove from unknown fields if it exists (check cell or label).
+            # FIX: unknown_fields entries store a display label in "label"
+            # (e.g. "Sheet1 — Company Name") and a coordinate in "cell"
+            # (e.g. "Sheet1!D6") -- field_label is always the display label, so
+            # comparing it against "cell" could never match and this filter
+            # never actually removed anything.
+            form.unknown_fields = [f for f in (form.unknown_fields or []) if (f.get("label") if isinstance(f, dict) else f) != field_label]
             db.commit()
 
     return {"saved": True, "field": field_label}
@@ -335,6 +350,7 @@ class FillProjectTableRequest(BaseModel):
     sheet_name: str
     table_type: str
     selected_ids: List[int]
+    subheading: Optional[str] = None
 
 @router.post("/forms/{form_id}/fill-project-table")
 def fill_project_table(
@@ -347,18 +363,43 @@ def fill_project_table(
         raise HTTPException(status_code=404, detail="Form not found")
 
     pending_tables = form.pending_project_tables or []
+
+    # FIX (P0 -- wrote to the wrong table): a single sheet very commonly has
+    # BOTH a "Client References" table and a "Major Work Done" table pending
+    # at once. This used to match on sheet_name alone, so it always grabbed
+    # whichever pending table for that sheet came first in the list --
+    # regardless of which one the request (and the user, picking from the
+    # UI) actually asked to fill. The selected records' data would then get
+    # written using the WRONG table's row/column layout, silently landing in
+    # some other table's cells while the table the user actually meant to
+    # fill was popped off the pending list as if it had been handled, or (if
+    # it happened to not be first) stayed marked pending forever with no
+    # cells ever written. Match on table_type too (and subheading, when the
+    # frontend sends it) so this can't cross-wire two tables on one sheet.
     target_table = None
     target_idx = -1
     for i, pt in enumerate(pending_tables):
-        if pt.get("sheet_name") == req.sheet_name:
-            target_table = pt
-            target_idx = i
-            break
-            
+        if pt.get("sheet_name") != req.sheet_name or pt.get("table_type") != req.table_type:
+            continue
+        if req.subheading and pt.get("subheading") != req.subheading:
+            continue
+        target_table = pt
+        target_idx = i
+        break
+
     if not target_table:
-        raise HTTPException(status_code=404, detail=f"No pending project table found for sheet '{req.sheet_name}'")
+        raise HTTPException(status_code=404, detail=f"No pending '{req.table_type}' table found for sheet '{req.sheet_name}'")
 
     table_fills = {}
+
+    # Real display labels for every known project-data column (e.g. "NAME OF
+    # CLIENT", "Contract duration (months)") -- used by find_field_value_in_record
+    # to fuzzy-match a canonical field like "client_name" against whatever the
+    # source spreadsheet actually called that column, instead of requiring an
+    # exact snake_case substring hit. Cheap enough to just always fetch (one
+    # query for the whole table, not per record).
+    from models.database import ProjectDataColumn
+    column_labels = {c.column_key: c.display_label for c in db.query(ProjectDataColumn).all()}
 
     # FIX (P0/P1): branch for the new deterministic "vertical block" layout (each
     # record's fields are stacked across rows in a single answer column) alongside
@@ -406,26 +447,9 @@ def fill_project_table(
             rec_dict = {r.id: r for r in records}
             ordered_records = [rec_dict[i] for i in ids_to_fill if i in rec_dict]
 
-            def _find_value(rec_data, m_key):
-                m_key = m_key.lower()
-                if m_key == "area_sqft": look_for = ["area", "sqft", "size"]
-                elif m_key == "amount": look_for = ["value", "billing", "contract", "amount", "cost"]
-                elif m_key == "location": look_for = ["location", "branch"]
-                elif m_key == "start_date": look_for = ["start"]
-                elif m_key == "completion_date": look_for = ["end", "completion"]
-                elif m_key == "duration": look_for = ["duration"]
-                elif m_key == "scope_of_work": look_for = ["scope"]
-                else: look_for = [m_key]
-
-                for dk, dv in rec_data.items():
-                    dk_lower = dk.lower()
-                    if any(lf in dk_lower for lf in look_for) and dv and isinstance(dv, str) and dv.strip():
-                        return dv.strip()
-                return None
-
             for rec, block_start in zip(ordered_records, block_start_rows):
                 for field_key, offset in field_row_offsets.items():
-                    val = _find_value(rec.data or {}, field_key)
+                    val = find_field_value_in_record(rec.data, field_key, column_labels)
                     if val:
                         row_num = block_start + offset
                         table_fills[f"{req.sheet_name}!{answer_col}{row_num}"] = val
@@ -490,24 +514,9 @@ def fill_project_table(
             rec_dict = {r.id: r for r in records}
             ordered_records = [rec_dict[i] for i in ids_to_fill if i in rec_dict]
 
-            # Helper to find value based on mapping key
-            def _find_value(rec_data, m_key):
-                m_key = m_key.lower()
-                if m_key == "area_sqft": look_for = ["area", "sqft", "size"]
-                elif m_key == "amount": look_for = ["value", "billing", "contract", "amount"]
-                elif m_key == "location": look_for = ["location", "branch"]
-                elif m_key in ["start_date", "completion_date"]: look_for = ["start"] if "start" in m_key else ["end", "completion"]
-                else: look_for = [m_key]
-
-                for dk, dv in rec_data.items():
-                    dk_lower = dk.lower()
-                    if any(lf in dk_lower for lf in look_for) and dv and isinstance(dv, str) and dv.strip():
-                        return dv.strip()
-                return None
-
             for rec, row_num in zip(ordered_records, available_rows):
                 for m_key, m_col in mapping.items():
-                    val = _find_value(rec.data or {}, m_key)
+                    val = find_field_value_in_record(rec.data, m_key, column_labels)
                     if val:
                         table_fills[f"{req.sheet_name}!{m_col}{row_num}"] = val
 

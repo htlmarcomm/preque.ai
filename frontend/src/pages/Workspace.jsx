@@ -1,8 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Folder, File, Plus, X, UploadCloud, ChevronRight, Archive, Send, Edit, Clock, HardDrive, CheckCircle2 } from 'lucide-react'
-
-const API_WORKSPACE = 'http://localhost:8000/api/workspace'
-const API_FILES = 'http://localhost:8000/api/project-files'
+import { workspaceApi, projectFilesApi } from '../lib/api'
 
 export default function Workspace() {
   const [packages, setPackages] = useState([])
@@ -32,15 +30,13 @@ export default function Workspace() {
   }, [])
 
   const fetchPackages = async () => {
-    const res = await fetch(API_WORKSPACE)
-    const data = await res.json()
-    setPackages(data)
+    const res = await workspaceApi.list()
+    setPackages(res.data)
   }
 
   const fetchFiles = async () => {
-    const res = await fetch(API_FILES)
-    const data = await res.json()
-    setFiles(data.files || [])
+    const res = await projectFilesApi.list()
+    setFiles(res.data.files || [])
   }
 
   const startNewPackage = () => {
@@ -60,17 +56,9 @@ export default function Workspace() {
     }
     
     const isNew = !activePackage.id
-    const url = isNew ? API_WORKSPACE : `${API_WORKSPACE}/${activePackage.id}`
-    const method = isNew ? 'POST' : 'PUT'
+    const res = isNew ? await workspaceApi.create(activePackage) : await workspaceApi.update(activePackage.id, activePackage)
 
-    const res = await fetch(url, {
-      method,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(activePackage)
-    })
-    
-    const saved = await res.json()
-    setActivePackage(saved)
+    setActivePackage(res.data)
     fetchPackages()
   }
 
@@ -80,20 +68,13 @@ export default function Workspace() {
     // First save the package with the new target URL
     const pkgToSave = { ...activePackage, target_sharepoint_url: exportTarget }
     const isNew = !pkgToSave.id
-    const saveRes = await fetch(isNew ? API_WORKSPACE : `${API_WORKSPACE}/${pkgToSave.id}`, {
-      method: isNew ? 'POST' : 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(pkgToSave)
-    })
-    const savedPkg = await saveRes.json()
+    const saveRes = isNew ? await workspaceApi.create(pkgToSave) : await workspaceApi.update(pkgToSave.id, pkgToSave)
+    const savedPkg = saveRes.data
 
     // Then trigger export
-    const exportRes = await fetch(`${API_WORKSPACE}/${savedPkg.id}/export`, {
-      method: 'POST'
-    })
-    const exportedPkg = await exportRes.json()
-    
-    setActivePackage(exportedPkg)
+    const exportRes = await workspaceApi.export(savedPkg.id)
+
+    setActivePackage(exportRes.data)
     fetchPackages()
     setShowExportModal(false)
     alert("Package successfully exported to SharePoint!")
@@ -105,21 +86,13 @@ export default function Workspace() {
     }
     setIsImporting(true)
     try {
-      const res = await fetch(`${API_WORKSPACE}/import`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(importData)
-      })
-      if (!res.ok) {
-        const error = await res.json()
-        throw new Error(error.detail || "Failed to import")
-      }
+      await workspaceApi.import(importData)
       await fetchPackages()
       setShowImportModal(false)
       setImportData({ name: '', client: '', target_sharepoint_url: '' })
       alert("Successfully imported folder!")
     } catch (e) {
-      alert("Import error: " + e.message)
+      alert("Import error: " + (e.response?.data?.detail || e.message))
     } finally {
       setIsImporting(false)
     }

@@ -5,7 +5,7 @@ from models.database import get_db, DocumentChunk
 from models.database import ProjectFile, ProjectReference
 from services.vector_store import VectorStore
 from routers.agent import RAG_FALLBACK_THRESHOLD
-from routers.forms import openai_client, VISION_MODEL
+from routers.forms import openai_client, VISION_MODEL, MINI_MODEL
 from typing import Optional
 import json
 
@@ -62,7 +62,8 @@ def ask_question(query: AskQuery, db: Session = Depends(get_db)):
             "Return ONLY a JSON array of 3 string queries."
         )
         expansion_resp = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=MINI_MODEL,
+            reasoning_effort="low",  # keep this fast -- it's just query rewriting, not sheet analysis
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": expansion_prompt},

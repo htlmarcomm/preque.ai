@@ -6,6 +6,7 @@ from typing import Optional, List
 import os, shutil, logging
 from services.doc_extractor import extract_text, chunk_text
 from services.vector_store import VectorStore
+from utils import sanitize_filename
 
 router = APIRouter()
 UPLOAD_DIR = "uploads/project_files"
@@ -84,7 +85,7 @@ async def upload_document(
     filename = None
     dest = None
     if file:
-        safe_name = file.filename.replace(" ", "_")
+        safe_name = sanitize_filename(file.filename)
         dest = os.path.join(UPLOAD_DIR, safe_name)
         with open(dest, "wb") as f:
             shutil.copyfileobj(file.file, f)

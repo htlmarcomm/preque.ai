@@ -11,6 +11,7 @@ export default function Documents() {
   const [seeding, setSeeding] = useState(false)
   const [adding, setAdding] = useState(false)
   const [newDoc, setNewDoc] = useState({ name: '', doc_type: '', sharepoint_link: '', tags: '', file: null })
+  const [downloadingId, setDownloadingId] = useState(null)
 
   const load = async () => {
     setLoading(true)
@@ -41,6 +42,19 @@ export default function Documents() {
     if (!confirm('Remove this document?')) return
     await docsApi.delete(id)
     load()
+  }
+
+  // A plain <a href download> can't carry the X-API-Key header the backend
+  // now requires, so this goes through the authenticated client instead.
+  const downloadDoc = async (doc) => {
+    setDownloadingId(doc.id)
+    try {
+      await docsApi.download(doc.id, doc.name)
+    } catch (e) {
+      console.error(e)
+    } finally {
+      setDownloadingId(null)
+    }
   }
 
   const filtered = docs.filter(d =>
@@ -155,9 +169,10 @@ export default function Documents() {
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
                       {doc.has_file && (
-                        <a href={doc.download_url} download className="btn-ghost text-xs py-1 px-2">
-                          <Download size={13} />Download
-                        </a>
+                        <button onClick={() => downloadDoc(doc)} disabled={downloadingId === doc.id}
+                          className="btn-ghost text-xs py-1 px-2">
+                          {downloadingId === doc.id ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}Download
+                        </button>
                       )}
                       {doc.sharepoint_link && (
                         <a href={doc.sharepoint_link} target="_blank" rel="noopener noreferrer"

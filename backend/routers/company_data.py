@@ -4,7 +4,7 @@ from models.database import get_db, CompanyField
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
-import openpyxl, io, json
+import openpyxl, io, json, os
 from utils import normalize_field_key
 
 router = APIRouter()
@@ -97,37 +97,108 @@ def dump_all(db: Session = Depends(get_db)):
 # ── IMPORT FROM EXCEL ─────────────────────────────────────────────────────
 @router.post("/import-excel")
 async def import_from_excel(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    import re as _re
     contents = await file.read()
     wb = openpyxl.load_workbook(io.BytesIO(contents), data_only=True)
     ws = wb.active
     imported = 0
     skipped = 0
-    for row in ws.iter_rows(values_only=True):
-        if not row or not row[0]:
+    errors = []
+
+    # Collect all rows to auto-detect whether column A is a serial-number column.
+    all_rows = list(ws.iter_rows(values_only=True))
+    if not all_rows:
+        return {"imported": 0, "updated": 0, "errors": []}
+
+    # Heuristic: if > 60% of non-empty column-A values are purely numeric,
+    # treat column A as a serial-number column and shift label/value to B/C.
+    col_a_vals = [str(r[0]).strip() for r in all_rows if r and r[0] is not None]
+    numeric_count = sum(1 for v in col_a_vals if _re.fullmatch(r'\d+', v))
+    has_serial_col = len(col_a_vals) > 0 and (numeric_count / len(col_a_vals)) > 0.6
+
+    # Also skip common header words in the first row
+    HEADER_WORDS = {"field", "label", "sr", "sr.", "sr no", "s.no", "s no", "sl",
+                    "sl.", "sl no", "no.", "sno", "serial", "particulars", "description",
+                    "parameter", "details", "item", ""}
+
+    current_section = "Basic Info"
+
+    for row in all_rows:
+        if not row:
             continue
-        field_label = str(row[0]).strip()
-        value = str(row[1]).strip() if row[1] is not None else ""
-        doc_link = str(row[2]).strip() if len(row) > 2 and row[2] else ""
-        if field_label.lower() in ("field", "label", ""):
-            continue
-        field_key = normalize_field_key(field_label)
-        existing = db.query(CompanyField).filter(CompanyField.field_key == field_key).first()
-        if existing:
-            existing.value = value
-            existing.document_link = doc_link
-            existing.last_updated = datetime.utcnow()
-            skipped += 1
+
+        # Determine label_col and value_col based on serial-number detection
+        if has_serial_col:
+            if len(row) < 2 or row[1] is None:
+                continue
+            raw_label = str(row[1]).strip()
+            raw_value = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
+            doc_link = str(row[3]).strip() if len(row) > 3 and row[3] else ""
         else:
-            db.add(CompanyField(
-                category="Basic Info",
-                field_key=field_key,
-                field_label=field_label,
-                value=value,
-                document_link=doc_link
-            ))
-            imported += 1
+            if row[0] is None:
+                continue
+            raw_label = str(row[0]).strip()
+            raw_value = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+            doc_link = str(row[2]).strip() if len(row) > 2 and row[2] else ""
+
+        if not raw_label:
+            continue
+
+        # Skip header rows
+        if raw_label.lower().strip() in HEADER_WORDS:
+            continue
+
+        # Detect section-header rows: label present but value is empty and the
+        # label looks like a section title (e.g. all-caps, or ends with colon,
+        # or is a known category-style phrase).
+        if not raw_value:
+            label_lower = raw_label.lower()
+            looks_like_section = (
+                raw_label.isupper() or
+                raw_label.endswith(":") or
+                any(kw in label_lower for kw in [
+                    "general information", "financial", "contact", "address",
+                    "registration", "legal", "manpower", "infrastructure",
+                    "compliance", "business profile", "capability", "identity",
+                    "project", "reference", "certification", "bank",
+                ])
+            )
+            if looks_like_section:
+                current_section = raw_label.strip().rstrip(":")
+                continue
+
+        field_key = normalize_field_key(raw_label)
+        if not field_key or _re.fullmatch(r'\d+', field_key):
+            # Pure-numeric keys are serial numbers that slipped through, skip
+            continue
+
+        try:
+            existing = db.query(CompanyField).filter(CompanyField.field_key == field_key).first()
+            if existing:
+                existing.value = raw_value
+                existing.document_link = doc_link
+                existing.last_updated = datetime.utcnow()
+                skipped += 1
+            else:
+                db.add(CompanyField(
+                    category=current_section,
+                    field_key=field_key,
+                    field_label=raw_label,
+                    value=raw_value,
+                    document_link=doc_link
+                ))
+                db.flush()  # catch IntegrityError per-row, not at the end
+                imported += 1
+        except Exception as e:
+            db.rollback()
+            errors.append(f"Row '{raw_label}': {str(e)[:120]}")
+            continue
+
     db.commit()
-    return {"imported": imported, "updated": skipped}
+    result = {"imported": imported, "updated": skipped}
+    if errors:
+        result["errors"] = errors[:10]  # return first 10 errors max
+    return result
 
 @router.post("/import-projects")
 async def import_projects_from_excel(file: UploadFile = File(...), db: Session = Depends(get_db)):
@@ -209,602 +280,16 @@ def seed_htl_data(db: Session = Depends(get_db)):
     if existing > 0:
         return {"message": "DB already seeded", "count": existing}
 
-    data = [
-    {
-        "category": "Company Identity",
-        "field_key": "company_name",
-        "field_label": "Company Name",
-        "value": "HTL Aircon Pvt Ltd",
-        "aliases": [
-            "contractor name",
-            "name of firm",
-            "organization name",
-            "supplier name"
-        ]
-    },
-    {
-        "category": "Company Identity",
-        "field_key": "brand_name",
-        "field_label": "Brand Name",
-        "value": "HTL",
-        "aliases": [
-            "trade name"
-        ]
-    },
-    {
-        "category": "Company Identity",
-        "field_key": "company_type",
-        "field_label": "Company Type",
-        "value": "Private Limited Company",
-        "aliases": [
-            "nature of firm",
-            "type of entity"
-        ]
-    },
-    {
-        "category": "Company Identity",
-        "field_key": "establishment_year",
-        "field_label": "Establishment Year",
-        "value": "1996",
-        "aliases": [
-            "founded",
-            "year of establishment",
-            "year started"
-        ]
-    },
-    {
-        "category": "Company Identity",
-        "field_key": "incorporation_date",
-        "field_label": "Incorporation Date",
-        "value": "16/01/1996",
-        "aliases": [
-            "date of incorporation",
-            "registration date"
-        ]
-    },
-    {
-        "category": "Address & Contact",
-        "field_key": "website",
-        "field_label": "Website",
-        "value": "https://www.htlaircon.com",
-        "aliases": [
-            "Company Website",
-            "URL",
-            "web address"
-        ]
-    },
-    {
-        "category": "Address & Contact",
-        "field_key": "address",
-        "field_label": "Registered Address",
-        "value": "38, Nand Ghanshyam Industrial Estate, Off Mahakali Caves Rd, Next to Sun Pharma, Behind Paper Box office, Andheri East, Mumbai",
-        "aliases": [
-            "address",
-            "correspondence address",
-            "mailing address",
-            "office address",
-            "head office",
-            "head office address"
-        ]
-    },
-    {
-        "category": "Address & Contact",
-        "field_key": "telephone",
-        "field_label": "Telephone No.",
-        "value": "022-42174747",
-        "aliases": [
-            "Telephone Number",
-            "landline",
-            "phone",
-            "tel"
-        ]
-    },
-    {
-        "category": "Address & Contact",
-        "field_key": "fax",
-        "field_label": "Fax No.",
-        "value": "022-42174748 / 49",
-        "aliases": [
-            "Fax Number",
-            "fax number"
-        ]
-    },
-    {
-        "category": "Address & Contact",
-        "field_key": "email",
-        "field_label": "Email",
-        "value": "sachin.baraskar@htlaircon.com",
-        "aliases": [
-            "contact email",
-            "e-mail",
-            "email address"
-        ]
-    },
-    {
-        "category": "Contact Persons",
-        "field_key": "contact_person_1_name",
-        "field_label": "Contact Person 1 \u2013 Name",
-        "value": "Mr. Sachin Baraskar",
-        "aliases": [
-            "Contact Person 1 - Name",
-            "Contact Person 1 Name",
-            "authorized signatory",
-            "contact person"
-        ]
-    },
-    {
-        "category": "Contact Persons",
-        "field_key": "contact_person_1_designation",
-        "field_label": "Contact Person 1 \u2013 Designation",
-        "value": "MEP Head - PAN India",
-        "aliases": [
-            "Contact Person 1 - Designation",
-            "Contact Person 1 Designation",
-            "designation"
-        ]
-    },
-    {
-        "category": "Contact Persons",
-        "field_key": "contact_person_1_mobile",
-        "field_label": "Contact Person 1 \u2013 Mobile",
-        "value": "85399 83333",
-        "aliases": [
-            "Contact Person 1 - Mobile",
-            "Contact Person 1 Mobile",
-            "cell phone",
-            "mobile"
-        ]
-    },
-    {
-        "category": "Contact Persons",
-        "field_key": "contact_person_2_name",
-        "field_label": "Contact Person 2 \u2013 Name",
-        "value": "Mr. Arun Kumar",
-        "aliases": [
-            "Contact Person 2 - Name",
-            "Contact Person 2 Name"
-        ]
-    },
-    {
-        "category": "Contact Persons",
-        "field_key": "contact_person_2_designation",
-        "field_label": "Contact Person 2 \u2013 Designation",
-        "value": "AGM",
-        "aliases": [
-            "Contact Person 2 - Designation",
-            "Contact Person 2 Designation"
-        ]
-    },
-    {
-        "category": "Contact Persons",
-        "field_key": "contact_person_2_mobile",
-        "field_label": "Contact Person 2 \u2013 Mobile",
-        "value": "98922 37561",
-        "aliases": [
-            "Contact Person 2 - Mobile",
-            "Contact Person 2 Mobile"
-        ]
-    },
-    {
-        "category": "Contact Persons",
-        "field_key": "director_name",
-        "field_label": "Director Name",
-        "value": "Lavinder Singh Duggal",
-        "aliases": [
-            "MD",
-            "director",
-            "managing director"
-        ]
-    },
-    {
-        "category": "Contact Persons",
-        "field_key": "din",
-        "field_label": "DIN",
-        "value": "01733700",
-        "aliases": [
-            "director identification number"
-        ]
-    },
-    {
-        "category": "Registration & Legal",
-        "field_key": "cin",
-        "field_label": "CIN No.",
-        "value": "U29306MH2007PTC173671",
-        "aliases": [
-            "CIN",
-            "CIN Number",
-            "CIN no",
-            "company identification number",
-            "corporate identity number"
-        ]
-    },
-    {
-        "category": "Registration & Legal",
-        "field_key": "gstin",
-        "field_label": "GSTIN",
-        "value": "27AABCH9057L1Z4",
-        "aliases": [
-            "GST no",
-            "GST number",
-            "GST registration",
-            "GSTIN no"
-        ]
-    },
-    {
-        "category": "Registration & Legal",
-        "field_key": "pan",
-        "field_label": "PAN No.",
-        "value": "AABCH9057L",
-        "aliases": [
-            "PAN",
-            "PAN Number",
-            "PAN number",
-            "permanent account number"
-        ]
-    },
-    {
-        "category": "Registration & Legal",
-        "field_key": "msme_reg_no",
-        "field_label": "MSME Registration No.",
-        "value": "",
-        "aliases": [
-            "MSME No",
-            "MSME No.",
-            "MSME Registration Number",
-            "Udyam Registration Number",
-            "Udyam No"
-        ]
-    },
-    {
-        "category": "Registration & Legal",
-        "field_key": "esi_reg_no",
-        "field_label": "ESI Registration No.",
-        "value": "35000074410000999",
-        "aliases": [
-            "ESI Registration Number",
-            "ESI no",
-            "ESIC number"
-        ]
-    },
-    {
-        "category": "Registration & Legal",
-        "field_key": "pf_reg_no",
-        "field_label": "PF Registration No.",
-        "value": "MH/PF/APP/211388/ENF VIII/1006",
-        "aliases": [
-            "EPF no",
-            "PF Registration Number",
-            "PF number",
-            "provident fund"
-        ]
-    },
-    {
-        "category": "Registration & Legal",
-        "field_key": "tds_no",
-        "field_label": "TDS No.",
-        "value": "MUMH11736E",
-        "aliases": [
-            "TAN",
-            "TDS Number",
-            "tax deduction account number"
-        ]
-    },
-    {
-        "category": "Registration & Legal",
-        "field_key": "ptrc_no",
-        "field_label": "PTRC No.",
-        "value": "27770637930P",
-        "aliases": [
-            "PTRC Number",
-            "profession tax registration"
-        ]
-    },
-    {
-        "category": "Registration & Legal",
-        "field_key": "ptec_no",
-        "field_label": "PTEC No.",
-        "value": "99861614598P",
-        "aliases": [
-            "PTEC Number"
-        ]
-    },
-    {
-        "category": "Registration & Legal",
-        "field_key": "wct_reg",
-        "field_label": "WCT Registration No.",
-        "value": "",
-        "aliases": [
-            "WCT Registration Number",
-            "WCT no",
-            "works contract tax"
-        ]
-    },
-    {
-        "category": "Registration & Legal",
-        "field_key": "iso_certified",
-        "field_label": "ISO Certified",
-        "value": "Yes",
-        "aliases": [
-            "ISO Certified?",
-            "ISO certification",
-            "quality certification"
-        ]
-    },
-    {
-        "category": "Manpower",
-        "field_key": "design_engineers",
-        "field_label": "Design Engineers",
-        "value": "11",
-        "aliases": [
-            "technical designers"
-        ]
-    },
-    {
-        "category": "Manpower",
-        "field_key": "senior_project_managers",
-        "field_label": "Senior Project Managers",
-        "value": "22",
-        "aliases": [
-            "senior PMs",
-            "sr project managers"
-        ]
-    },
-    {
-        "category": "Manpower",
-        "field_key": "planning_commercial_team",
-        "field_label": "Planning / Commercial Team",
-        "value": "10",
-        "aliases": [
-            "commercial team",
-            "planning team"
-        ]
-    },
-    {
-        "category": "Manpower",
-        "field_key": "site_engineers",
-        "field_label": "Site Engineers",
-        "value": "25",
-        "aliases": [
-            "field engineers"
-        ]
-    },
-    {
-        "category": "Manpower",
-        "field_key": "supervisors",
-        "field_label": "Supervisors",
-        "value": "30",
-        "aliases": []
-    },
-    {
-        "category": "Manpower",
-        "field_key": "safety_personnel",
-        "field_label": "Safety Personnel",
-        "value": "25",
-        "aliases": [
-            "EHS staff",
-            "safety engineers"
-        ]
-    },
-    {
-        "category": "Manpower",
-        "field_key": "quality_personnel",
-        "field_label": "Quality Personnel",
-        "value": "5",
-        "aliases": [
-            "QA/QC staff"
-        ]
-    },
-    {
-        "category": "Manpower",
-        "field_key": "skilled_technicians",
-        "field_label": "Skilled Technicians",
-        "value": "140",
-        "aliases": [
-            "skilled workers",
-            "technicians"
-        ]
-    },
-    {
-        "category": "Manpower",
-        "field_key": "total_inhouse_manpower",
-        "field_label": "Total In-House Manpower",
-        "value": "600",
-        "aliases": [
-            "staff strength",
-            "total employees",
-            "total staff"
-        ]
-    },
-    {
-        "category": "Manpower",
-        "field_key": "total_outsourced_manpower",
-        "field_label": "Total Outsourced Manpower",
-        "value": "2000",
-        "aliases": [
-            "contract labour",
-            "outsourced workers"
-        ]
-    },
-    {
-        "category": "Infrastructure",
-        "field_key": "mfg_unit_1_location",
-        "field_label": "Manufacturing Unit 1",
-        "value": "Murbad, Maharashtra",
-        "aliases": [
-            "Manufacturing Unit 1 - Location",
-            "Manufacturing Unit 1 Location",
-            "factory",
-            "workshop"
-        ]
-    },
-    {
-        "category": "Infrastructure",
-        "field_key": "mfg_unit_2_location",
-        "field_label": "Manufacturing Unit 2",
-        "value": "Taloja, Maharashtra",
-        "aliases": [
-            "Manufacturing Unit 2 - Location",
-            "Manufacturing Unit 2 Location"
-        ]
-    },
-    {
-        "category": "Financial",
-        "field_key": "bank_guarantee_limit",
-        "field_label": "Bank Guarantee Limit (\u20b9 Crore)",
-        "value": "76",
-        "aliases": [
-            "BG limit",
-            "Bank Guarantee Limit (\u20b9 Cr)",
-            "bank guarantee capacity"
-        ]
-    },
-    {
-        "category": "Financial",
-        "field_key": "banker_credit_limit",
-        "field_label": "Banker Credit Limit (\u20b9 Crore)",
-        "value": "21",
-        "aliases": [
-            "Banker Credit Limit (\u20b9 Cr)",
-            "credit limit",
-            "working capital limit"
-        ]
-    },
-    {
-        "category": "Financial",
-        "field_key": "litigation",
-        "field_label": "Any Litigation / Arbitration",
-        "value": "NA",
-        "aliases": [
-            "Litigation & Arbitration Cases",
-            "Litigation and Arbitration Cases",
-            "arbitration",
-            "court cases",
-            "legal disputes",
-            "pending litigation"
-        ]
-    },
-    {
-        "category": "Business Profile & Capability",
-        "field_key": "primary_scope",
-        "field_label": "Primary Scope of Work",
-        "value": "MEP \u2013 Electrical, HVAC, PHE, Fire Fighting, IBMS",
-        "aliases": [
-            "Scope of Work / Services",
-            "business activity",
-            "nature of work",
-            "services offered",
-            "type of work"
-        ]
-    },
-    {
-        "category": "Business Profile & Capability",
-        "field_key": "major_consultants",
-        "field_label": "Major Consultants Worked With",
-        "value": "JLL, CBRE, Cushman & Wakefield, Hill International, SC Consultants, Epicons, Ecofirst",
-        "aliases": [
-            "consultants",
-            "list of consultants"
-        ]
-    },
-    {
-        "category": "Business Profile & Capability",
-        "field_key": "major_architects",
-        "field_label": "Major Architects Worked With",
-        "value": "As per attached profile",
-        "aliases": [
-            "architects"
-        ]
-    },
-    {
-        "category": "Business Profile & Capability",
-        "field_key": "major_pmcs",
-        "field_label": "PMCs Worked With",
-        "value": "JLL, CBRE, Cushman & Wakefield",
-        "aliases": [
-            "Major PMCs Worked With",
-            "PMC",
-            "project management consultants"
-        ]
-    },
-    {
-        "category": "Business Profile & Capability",
-        "field_key": "major_suppliers",
-        "field_label": "Major Suppliers",
-        "value": "Daikin, Erlab, MRC",
-        "aliases": [
-            "equipment suppliers",
-            "material suppliers"
-        ]
-    },
-    {
-        "category": "Business Profile & Capability",
-        "field_key": "awards",
-        "field_label": "Awards & Recognition",
-        "value": "LOA - Taj Hotel, LOA - UBS, LOA - German Consulate, Excellence in Business Award",
-        "aliases": [
-            "Awards & Recognitions",
-            "Awards and Recognition",
-            "Awards and Recognitions",
-            "achievements",
-            "certificates of appreciation",
-            "recognitions"
-        ]
-    },
-    {
-        "category": "Business Profile & Capability",
-        "field_key": "foreign_tie_ups",
-        "field_label": "Foreign Tie-Ups",
-        "value": "None",
-        "aliases": [
-            "Tie-up with Indian/Foreign Partners",
-            "collaborations",
-            "foreign tie-ups",
-            "joint venture"
-        ]
-    },
-    {
-        "category": "Registration & Legal",
-        "field_key": "iso_standard",
-        "field_label": "ISO Standard",
-        "value": "ISO 45001",
-        "aliases": []
-    },
-    {
-        "category": "Manpower",
-        "field_key": "other_staff",
-        "field_label": "Others (specify)",
-        "value": "150",
-        "aliases": []
-    },
-    {
-        "category": "Business Profile & Capability",
-        "field_key": "sectors_served",
-        "field_label": "Sectors Served",
-        "value": "Commercial, Hospitality, Data Centers, Residential, Industrial, Healthcare",
-        "aliases": []
-    },
-    {
-        "category": "Compliance",
-        "field_key": "ehs_system",
-        "field_label": "EHS System Implementation",
-        "value": "As attached in PDF Format",
-        "aliases": []
-    },
-    {
-        "category": "Compliance",
-        "field_key": "quality_assurance",
-        "field_label": "Quality Assurance Methodology",
-        "value": "As attached in Profile",
-        "aliases": []
-    },
-    {
-        "category": "Compliance",
-        "field_key": "solvency_certificate",
-        "field_label": "Solvency Certificate from Banker",
-        "value": "As attached in File",
-        "aliases": []
-    }
-]
+    seed_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "seed_data", "company_seed.json")
+    if not os.path.exists(seed_path):
+        raise HTTPException(
+            500,
+            "Seed data file not found at backend/seed_data/company_seed.json. "
+            "This file holds company-identifying data (GSTIN, PAN, contact numbers) "
+            "and is intentionally gitignored -- ask an admin for a copy."
+        )
+    with open(seed_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
     for item in data:
         db.add(CompanyField(**item))

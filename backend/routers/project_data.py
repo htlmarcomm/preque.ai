@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from models.database import get_db, ProjectDataRecord, ProjectDataColumn, ProjectDataSheet
+from utils import sanitize_filename
 import openpyxl
 
 router = APIRouter()
@@ -38,7 +39,7 @@ async def import_project_data(file: UploadFile = File(...), db: Session = Depend
     upload_dir = "uploads/project_data_imports"
     os.makedirs(upload_dir, exist_ok=True)
     timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    safe_filename = f"{timestamp}_{file.filename}"
+    safe_filename = f"{timestamp}_{sanitize_filename(file.filename)}"
     file_path = os.path.join(upload_dir, safe_filename)
     with open(file_path, "wb") as f:
         f.write(contents)

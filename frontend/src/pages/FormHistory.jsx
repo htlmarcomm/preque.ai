@@ -6,6 +6,20 @@ export default function FormHistory() {
   const [forms, setForms] = useState([])
   const [loading, setLoading] = useState(true)
   const [expanded, setExpanded] = useState(null)
+  const [downloadingId, setDownloadingId] = useState(null)
+
+  // A plain <a href download> can't carry the X-API-Key header the backend
+  // now requires, so this goes through the authenticated client instead.
+  const downloadForm = async (form) => {
+    setDownloadingId(form.id)
+    try {
+      await formsApi.download(form.id, `${form.client_name || 'form'}.xlsx`)
+    } catch (e) {
+      console.error(e)
+    } finally {
+      setDownloadingId(null)
+    }
+  }
 
   useEffect(() => {
     formsApi.history().then(r => {
@@ -68,12 +82,20 @@ export default function FormHistory() {
                   <div className="p-4">
                     <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">Filled answers</p>
                     <div className="bg-white rounded-lg border border-gray-100 divide-y divide-gray-50">
-                      {Object.entries(form.filled_data || {}).map(([label, value]) => (
-                        <div key={label} className="px-4 py-2 flex gap-4">
-                          <span className="text-xs text-gray-400 w-56 shrink-0 pt-0.5">{label}</span>
-                          <span className="text-xs font-medium text-gray-800 flex-1">{value}</span>
-                        </div>
-                      ))}
+                      {Object.entries(form.filled_data || {}).map(([key, data]) => {
+                        // FIX: excel-mode fills store {label, value} objects here (see
+                        // agent.py's process_excel_form / save_learned_answer), not plain
+                        // strings -- rendering `data` directly crashed React ("Objects are
+                        // not valid as a React child") for any form filled that way.
+                        const label = typeof data === 'object' && data !== null ? data.label : key
+                        const value = typeof data === 'object' && data !== null ? data.value : data
+                        return (
+                          <div key={key} className="px-4 py-2 flex gap-4">
+                            <span className="text-xs text-gray-400 w-56 shrink-0 pt-0.5">{label}</span>
+                            <span className="text-xs font-medium text-gray-800 flex-1">{value}</span>
+                          </div>
+                        )
+                      })}
                     </div>
                   </div>
 
@@ -82,9 +104,14 @@ export default function FormHistory() {
                     <div className="px-4 pb-4">
                       <p className="text-xs font-semibold text-amber-600 uppercase tracking-wider mb-2">Pending fields</p>
                       <div className="flex flex-wrap gap-2">
-                        {form.unknown_fields.map(f => (
-                          <span key={f} className="badge-amber text-xs">{f}</span>
-                        ))}
+                        {form.unknown_fields.map((f, i) => {
+                          // FIX: entries here are {label, cell, suggested_answer, ...}
+                          // objects for excel-mode forms (see agent.py's enriched_unknown),
+                          // not plain strings -- same crash as filled_data above, plus using
+                          // the object itself as a React `key` produced duplicate-key warnings.
+                          const label = typeof f === 'object' && f !== null ? f.label : f
+                          return <span key={i} className="badge-amber text-xs">{label}</span>
+                        })}
                       </div>
                     </div>
                   )}
@@ -106,9 +133,9 @@ export default function FormHistory() {
                   {/* Download */}
                   {form.form_type === 'excel' && (
                     <div className="px-4 pb-4">
-                      <a href={formsApi.download(form.id)} download className="btn-secondary text-sm">
-                        <Download size={14} />Download filled form
-                      </a>
+                      <button onClick={() => downloadForm(form)} disabled={downloadingId === form.id} className="btn-secondary text-sm">
+                        {downloadingId === form.id ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}Download filled form
+                      </button>
                     </div>
                   )}
                 </div>

@@ -4,16 +4,25 @@ import FillForm from './pages/FillForm'
 import CompanyDB from './pages/CompanyDB'
 import FormHistory from './pages/FormHistory'
 import ProjectFiles from './pages/ProjectFiles'
+import Documents from './pages/Documents'
 import Workspace from './pages/Workspace'
 import DocumentSearch from './pages/DocumentSearch'
 import SubContractors from './pages/SubContractors'
 import ProjectHistory from './pages/ProjectHistory'
 
+// FIX: this page/route was missing entirely -- Documents.jsx is the only UI
+// that creates ProjectFile rows with source_module="document" (via
+// POST /api/documents/upload), which is what get_doc_checklist() in
+// forms.py matches against to build the "Documents to attach" checklist on
+// every filled form. Without a route to it, that checklist could only ever
+// grow via the one-time /api/documents/seed list -- there was no way for a
+// user to add a newly-obtained certificate to it at all.
 const navItems = [
   { to: '/',          icon: Zap,        label: 'Fill Form'    },
   { to: '/history',   icon: History,    label: 'History'      },
   { to: '/company',   icon: Database,   label: 'Company Data' },
   { to: '/files',     icon: Archive,    label: 'File Cabinet' },
+  { to: '/documents', icon: FileText,   label: 'Documents'    },
   { to: '/workspaces',icon: Briefcase,  label: 'Workspaces'   },
   { to: '/subcontractors', icon: Users, label: 'Subcontractors' },
   { to: '/projects', icon: Briefcase, label: 'Project History' },
@@ -51,6 +60,7 @@ export default function App() {
             <Route path="/history" element={<FormHistory />} />
             <Route path="/company" element={<CompanyDB />} />
             <Route path="/files" element={<ProjectFiles />} />
+            <Route path="/documents" element={<Documents />} />
             <Route path="/workspaces" element={<Workspace />} />
             <Route path="/subcontractors" element={<SubContractors />} />
             <Route path="/projects" element={<ProjectHistory />} />

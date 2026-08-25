@@ -56,11 +56,14 @@ def export_form_to_google_sheets(form_id: int, db: Session = Depends(get_db)):
         media = MediaFileUpload(out_path, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', resumable=True)
         
         file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
-        
-        # Make the file publicly editable
+
+        # Anyone with the link can view. NOT 'writer' -- these exports contain
+        # GSTIN/PAN/financials, so leaving them world-editable indefinitely is
+        # a needless risk. If a specific recipient needs edit access, share
+        # that explicitly from Drive rather than opening it to anyone.
         permission = {
             'type': 'anyone',
-            'role': 'writer',
+            'role': 'reader',
         }
         service.permissions().create(fileId=file.get('id'), body=permission).execute()
         

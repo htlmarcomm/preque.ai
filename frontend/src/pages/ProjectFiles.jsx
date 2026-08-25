@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
-import { Search, Upload, Link, X, Eye, Download, Trash2, ChevronDown, ChevronRight, Tag, Building2, FileSpreadsheet, Plus, Copy, Check, FileText } from 'lucide-react'
-
-const API = 'http://localhost:8000/api/project-files'
+import { Search, Upload, Link, X, Eye, Download, Trash2, ChevronDown, ChevronRight, Tag, Building2, FileSpreadsheet, Plus, Copy, Check, FileText, Loader2 } from 'lucide-react'
+import { projectFilesApi } from '../lib/api'
 
 const CATEGORY_COLORS = {
   'Project Registry':        '#f59e0b',
@@ -32,28 +31,29 @@ export default function ProjectFiles() {
   const [copiedCell, setCopiedCell]     = useState(null)
   const [loading, setLoading]           = useState(false)
   const [previewLoading, setPreviewLoading] = useState(false)
+  const [downloadingId, setDownloadingId] = useState(null)
+  const mediaObjectUrlRef = useRef(null)
 
   useEffect(() => { fetchFiles(); fetchCategories() }, [])
+  useEffect(() => () => releaseMediaPreview(), [])
 
   async function fetchFiles() {
     setLoading(true)
     try {
-      const params = new URLSearchParams()
-      if (search)       params.append('search',   search)
-      if (filterClient) params.append('client',   filterClient)
-      if (filterCat)    params.append('category', filterCat)
-      const res = await fetch(`${API}/?${params}`)
-      const data = await res.json()
-      setFiles(data.files || [])
+      const params = {}
+      if (search)       params.search   = search
+      if (filterClient) params.client   = filterClient
+      if (filterCat)    params.category = filterCat
+      const res = await projectFilesApi.list(params)
+      setFiles(res.data.files || [])
     } catch (e) { console.error(e) }
     setLoading(false)
   }
 
   async function fetchCategories() {
     try {
-      const res = await fetch(`${API}/categories`)
-      const data = await res.json()
-      setCategories(data.categories || [])
+      const res = await projectFilesApi.getCategories()
+      setCategories(res.data.categories || [])
     } catch (e) {}
   }
 
@@ -61,17 +61,38 @@ export default function ProjectFiles() {
 
   async function deleteFile(id) {
     if (!confirm('Delete this file?')) return
-    await fetch(`${API}/${id}`, { method: 'DELETE' })
+    await projectFilesApi.delete(id)
     fetchFiles()
   }
 
   async function updateFileCategory(id, newCategory) {
-    await fetch(`${API}/${id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ category: newCategory })
-    })
+    await projectFilesApi.update(id, { category: newCategory })
     fetchFiles()
+  }
+
+  async function downloadFileById(file) {
+    setDownloadingId(file.id)
+    try {
+      await projectFilesApi.download(file.id, file.filename || file.name)
+    } catch (e) {
+      alert(e.response?.data?.detail || e.message || 'Download failed.')
+    } finally {
+      setDownloadingId(null)
+    }
+  }
+
+  // Object URLs used for inline PDF/image previews must be revoked once
+  // they're no longer shown, or each preview leaks the blob's memory.
+  function releaseMediaPreview() {
+    if (mediaObjectUrlRef.current) {
+      window.URL.revokeObjectURL(mediaObjectUrlRef.current)
+      mediaObjectUrlRef.current = null
+    }
+  }
+
+  function closePreview() {
+    releaseMediaPreview()
+    setPreview(null)
   }
 
   async function openPreview(file) {
@@ -79,30 +100,31 @@ export default function ProjectFiles() {
       alert('No uploaded file — only a SharePoint link is stored. Open it via the link.')
       return
     }
+    releaseMediaPreview()
     setPreviewLoading(true)
     setPreview(null)
     setActiveSheet(null)
     setPreviewSearch('')
     setColumnFilters({})
-    
+
     const ext = file.filename.split('.').pop().toLowerCase()
 
     try {
       if (['xlsx', 'xls', 'csv'].includes(ext)) {
-        const res = await fetch(`${API}/${file.id}/preview`)
-        const data = await res.json()
-        if (!res.ok) throw new Error(data.detail || 'Server error')
-        setPreview({ type: 'excel', ...data })
-        const firstSheet = Object.keys(data.sheets || {})[0]
+        const res = await projectFilesApi.preview(file.id)
+        setPreview({ type: 'excel', ...res.data })
+        const firstSheet = Object.keys(res.data.sheets || {})[0]
         setActiveSheet(firstSheet)
       } else if (['pdf', 'jpg', 'jpeg', 'png', 'gif'].includes(ext)) {
-        setPreview({ type: 'media', url: `${API}/${file.id}/view`, name: file.name, ext })
+        const url = await projectFilesApi.viewUrl(file.id)
+        mediaObjectUrlRef.current = url
+        setPreview({ type: 'media', url, name: file.name, ext })
       } else {
         throw new Error('Preview not supported for this file type. Please click Download.')
       }
-    } catch (e) { 
+    } catch (e) {
       setPreview(null)
-      alert(e.message) 
+      alert(e.response?.data?.detail || e.message)
     }
     setPreviewLoading(false)
   }
@@ -213,6 +235,8 @@ export default function ProjectFiles() {
               onToggle={() => setCollapsed(p => ({ ...p, [cat]: !p[cat] }))}
               onPreview={openPreview}
               onDelete={deleteFile}
+              onDownload={downloadFileById}
+              downloadingId={downloadingId}
               categories={categories}
               onUpdateCategory={updateFileCategory}
             />
@@ -243,7 +267,7 @@ export default function ProjectFiles() {
                     />
                   </div>
                 )}
-                <button onClick={() => setPreview(null)} style={{ background: '#f1f5f9', border: 'none', borderRadius: 6, padding: '6px 8px', cursor: 'pointer' }}>
+                <button onClick={closePreview} style={{ background: '#f1f5f9', border: 'none', borderRadius: 6, padding: '6px 8px', cursor: 'pointer' }}>
                   <X size={16} color="#64748b" />
                 </button>
               </div>
@@ -349,7 +373,7 @@ export default function ProjectFiles() {
 }
 
 /* ── Category Group ── */
-function CategoryGroup({ cat, files, collapsed, onToggle, onPreview, onDelete, categories, onUpdateCategory }) {
+function CategoryGroup({ cat, files, collapsed, onToggle, onPreview, onDelete, onDownload, downloadingId, categories, onUpdateCategory }) {
   const color = CATEGORY_COLORS[cat] || '#6b7280'
   return (
     <div style={{ marginBottom: 14, background: '#fff', borderRadius: 10, border: '1.5px solid #e2e8f0', overflow: 'hidden' }}>
@@ -362,7 +386,7 @@ function CategoryGroup({ cat, files, collapsed, onToggle, onPreview, onDelete, c
       </button>
       {!collapsed && (
         <div style={{ borderTop: '1px solid #f1f5f9' }}>
-          {files.map(f => <FileRow key={f.id} file={f} onPreview={onPreview} onDelete={onDelete} categories={categories} onUpdateCategory={onUpdateCategory} />)}
+          {files.map(f => <FileRow key={f.id} file={f} onPreview={onPreview} onDelete={onDelete} onDownload={onDownload} downloadingId={downloadingId} categories={categories} onUpdateCategory={onUpdateCategory} />)}
         </div>
       )}
     </div>
@@ -370,7 +394,7 @@ function CategoryGroup({ cat, files, collapsed, onToggle, onPreview, onDelete, c
 }
 
 /* ── File Row ── */
-function FileRow({ file, onPreview, onDelete, categories, onUpdateCategory }) {
+function FileRow({ file, onPreview, onDelete, onDownload, downloadingId, categories, onUpdateCategory }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 16px', borderBottom: '1px solid #f8fafc', flexWrap: 'wrap' }}>
       {file.filename && !['xlsx', 'xls', 'csv'].includes(file.filename.split('.').pop().toLowerCase()) 
@@ -419,10 +443,10 @@ function FileRow({ file, onPreview, onDelete, categories, onUpdateCategory }) {
               style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '5px 10px', background: '#ede9fe', border: 'none', borderRadius: 6, fontSize: 11, color: '#dc2626', cursor: 'pointer', fontWeight: 600 }}>
               <Eye size={12} /> Preview
             </button>
-            <a href={`http://localhost:8000/api/project-files/${file.id}/download`}
-              style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '5px 10px', background: '#f0fdf4', border: 'none', borderRadius: 6, fontSize: 11, color: '#10b981', cursor: 'pointer', textDecoration: 'none' }}>
-              <Download size={12} /> Download
-            </a>
+            <button onClick={() => onDownload(file)} disabled={downloadingId === file.id}
+              style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '5px 10px', background: '#f0fdf4', border: 'none', borderRadius: 6, fontSize: 11, color: '#10b981', cursor: 'pointer' }}>
+              {downloadingId === file.id ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />} Download
+            </button>
           </>
         )}
         <button onClick={() => onDelete(file.id)}
@@ -446,7 +470,7 @@ function UploadForm({ categories, onDone, onCancel }) {
     const fd = new FormData()
     Object.entries(form).forEach(([k, v]) => fd.append(k, v))
     if (file) fd.append('file', file)
-    await fetch(`${API}/upload`, { method: 'POST', body: fd })
+    await projectFilesApi.upload(fd)
     setLoading(false)
     onDone()
   }
@@ -479,7 +503,7 @@ function LinkForm({ categories, onDone, onCancel }) {
     setLoading(true)
     const fd = new FormData()
     Object.entries(form).forEach(([k, v]) => fd.append(k, v))
-    await fetch(`${API}/add-sharepoint`, { method: 'POST', body: fd })
+    await projectFilesApi.addSharepoint(fd)
     setLoading(false)
     onDone()
   }

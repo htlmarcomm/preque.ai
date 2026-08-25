@@ -13,3 +13,4 @@ uploads/
 .vscode/
 *.db
 *.log
+backend/seed_data/

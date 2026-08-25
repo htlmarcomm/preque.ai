@@ -90,10 +90,13 @@ temporarily swap the import for any placeholder image.
 
 ### 3. First-time setup in the app (fresh installs only — skip if upgrading)
 
-1. Go to **Company Data** → click "Load HTL Data" — seeds all HTL Aircon fields from the pre-qual form
-2. Go to **Documents** → click "Load Document List" — seeds the default document registry
-3. Add SharePoint links to each document so they appear in output checklists
-4. Done! Go to **Fill Form** and upload your first pre-qual form
+1. Place `company_seed.json` in `backend/seed_data/` (gitignored — it holds real
+   company-identifying data like GSTIN/PAN/contact numbers, so it's distributed
+   out-of-band, not committed; ask an admin for a copy).
+2. Go to **Company Data** → click "Load HTL Data" — seeds all HTL Aircon fields from `backend/seed_data/company_seed.json`
+3. Go to **Documents** → click "Load Document List" — seeds the default document registry
+4. Add SharePoint links to each document so they appear in output checklists
+5. Done! Go to **Fill Form** and upload your first pre-qual form
 
 ---
 

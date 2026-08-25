@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { Upload, Image, FileSpreadsheet, Sparkles, CheckCircle2, AlertCircle, Download, Copy, FileCheck, ChevronRight, X, Save, Loader2, RotateCcw, FileText, Search, Eye, Check, Database } from 'lucide-react'
-import { agentApi, formsApi, projectPickerApi, projectDataApi } from '../lib/api'
+import { agentApi, formsApi, docsApi, projectPickerApi, projectDataApi } from '../lib/api'
 import { useFillForm } from '../contexts/FillFormContext'
 
 const BASE_STEPS = ['Upload', 'Processing', 'Review', 'Output']
@@ -49,6 +49,34 @@ export default function FillForm() {
   } = useFillForm()
 
   const fileRef = useRef()
+  const [downloading, setDownloading] = useState(false)
+  const [downloadingDocId, setDownloadingDocId] = useState(null)
+
+  // Downloads have to go through the authenticated axios client and get
+  // saved as a blob -- a plain <a href download> can't carry the X-API-Key
+  // header the backend now requires on every /api/* request.
+  const downloadFilledForm = async () => {
+    if (!result?.form_id) return
+    setDownloading(true)
+    try {
+      await formsApi.download(result.form_id, `${result.client_name}.xlsx`)
+    } catch (e) {
+      setError(e.response?.data?.detail || e.message || 'Download failed.')
+    } finally {
+      setDownloading(false)
+    }
+  }
+
+  const downloadDoc = async (doc) => {
+    setDownloadingDocId(doc.id)
+    try {
+      await docsApi.download(doc.id, doc.name)
+    } catch (e) {
+      setError(e.response?.data?.detail || e.message || `Could not download "${doc.name}".`)
+    } finally {
+      setDownloadingDocId(null)
+    }
+  }
 
   const handleFile = (f) => {
     setFile(f)
@@ -76,7 +104,7 @@ export default function FillForm() {
       const firstSheet = Object.keys(data.sheets || {})[0]
       setActiveSheet(firstSheet)
     } catch (e) {
-      alert(e.response?.data?.detail || e.message || 'Preview not available yet.')
+      setError(e.response?.data?.detail || e.message || 'Preview not available yet.')
     } finally {
       setPreviewLoading(false)
     }
@@ -253,12 +281,19 @@ export default function FillForm() {
         setStep(pendingTables.length > 0 ? 3 : 2) // Jump to Review step
       }
     } catch (e) {
-      const detail = e.response?.data?.detail
-      const msg = typeof detail === 'string'
-        ? detail
-        : detail?.msg || JSON.stringify(detail) || e.message || 'Processing failed.'
+      let msg
+      if (e.code === 'ECONNABORTED' || e.message?.includes('timeout')) {
+        msg = 'Request timed out. The form may have too many sheets. Please try again.'
+      } else if (!e.response) {
+        msg = 'Cannot connect to the backend server. Make sure the backend is running on port 8000.'
+      } else {
+        const detail = e.response?.data?.detail
+        msg = typeof detail === 'string'
+          ? detail
+          : detail?.msg || JSON.stringify(detail) || e.message || 'Processing failed.'
+      }
       setError(msg)
-      console.error('Full error:', e.response?.data)
+      console.error('Full error:', e.response?.data || e.message)
       setStep(0)
     } finally {
       setLoading(false)
@@ -272,18 +307,20 @@ export default function FillForm() {
     try {
       await agentApi.saveLearnedAnswer(fieldLabel, answer, result?.form_id, true)
       setSavedFields(prev => new Set([...prev, fieldLabel]))
-    } catch (e) { console.error(e) }
-    finally { setSavingField(null) }
+    } catch (e) {
+      setError(e.response?.data?.detail || e.message || `Could not save "${fieldLabel}".`)
+    } finally { setSavingField(null) }
   }
 
   const saveAllAnswers = async () => {
-    for (const [label, answer] of Object.entries(humanAnswers)) {
-      if (answer?.trim() && !savedFields.has(label)) {
-        await agentApi.saveLearnedAnswer(label, answer, result?.form_id, true)
-      }
+    const toSave = Object.entries(humanAnswers).filter(([label, answer]) => answer?.trim() && !savedFields.has(label))
+    try {
+      await Promise.all(toSave.map(([label, answer]) => agentApi.saveLearnedAnswer(label, answer, result?.form_id, true)))
+      setSavedFields(new Set(Object.keys(humanAnswers)))
+      setStep(pendingTables.length > 0 ? 4 : 3)
+    } catch (e) {
+      setError(e.response?.data?.detail || e.message || 'Could not save one or more answers. Please try again.')
     }
-    setSavedFields(new Set(Object.keys(humanAnswers)))
-    setStep(pendingTables.length > 0 ? 4 : 3)
   }
 
   const copyAllToClipboard = () => {
@@ -307,7 +344,8 @@ export default function FillForm() {
         result.form_id,
         current.sheet_name,
         current.table_type,
-        Array.from(pickerSelectedIds)
+        Array.from(pickerSelectedIds),
+        current.subheading
       )
       
       const freshResult = await formsApi.get(result.form_id)
@@ -319,8 +357,7 @@ export default function FillForm() {
         setActivePendingIndex(prev => prev + 1)
       }
     } catch (e) {
-      console.error(e)
-      alert('Failed to fill table.')
+      setError(e.response?.data?.detail || e.message || 'Failed to fill table.')
     } finally {
       setPickerSubmitting(false)
     }
@@ -334,24 +371,25 @@ export default function FillForm() {
     }
   }
 
-  const allFieldsFilled = result && (result.unknown_fields?.length === 0 ||
-    result.unknown_fields?.every(f => {
-      const key = typeof f === 'object' && f.cell ? f.cell : (typeof f === 'object' ? f.label : f);
-      return humanAnswers[key]?.trim();
-    }))
+  const isOutputStep = step === (pendingTables.length > 0 ? 4 : 3) && !!result
 
   return (
     <div className="p-8 max-w-5xl">
       {/* Header */}
-      <div className="mb-8">
-        <div className="flex items-center gap-2 mb-3">
-          <div className="w-8 h-8 bg-red-600 rounded-lg flex items-center justify-center shadow-sm">
-            <FileText size={16} className="text-white" />
+      <div className="mb-8 flex items-start justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2 mb-3">
+            <div className="w-8 h-8 bg-red-600 rounded-lg flex items-center justify-center shadow-sm">
+              <FileText size={16} className="text-white" />
+            </div>
+            <span className="font-bold text-lg text-gray-900">PreQue AI</span>
           </div>
-          <span className="font-bold text-lg text-gray-900">PreQue AI</span>
+          <h1 className="text-2xl font-semibold text-gray-900">Fill Pre-Qualification Form</h1>
+          <p className="text-gray-500 text-sm mt-1">Upload a form or portal screenshot — AI fills it from your company database</p>
         </div>
-        <h1 className="text-2xl font-semibold text-gray-900">Fill Pre-Qualification Form</h1>
-        <p className="text-gray-500 text-sm mt-1">Upload a form or portal screenshot — AI fills it from your company database</p>
+        {isOutputStep && (
+          <button onClick={reset} className="btn-secondary shrink-0"><RotateCcw size={16} />Fill a new form</button>
+        )}
       </div>
 
       {/* Step indicator */}
@@ -430,7 +468,7 @@ export default function FillForm() {
               onDrop={handleDrop}
             >
               <input ref={fileRef} type="file" className="hidden"
-                accept={mode === 'excel' ? '.xlsx,.xls,.csv' : 'image/*'}
+                accept={mode === 'excel' ? '.xlsx,.xls' : 'image/*'}
                 onChange={e => handleFile(e.target.files[0])} />
               {file ? (
                 <div className="flex items-center justify-center gap-3">
@@ -1013,11 +1051,11 @@ export default function FillForm() {
                     <Eye size={16} />
                     Preview Excel
                   </button>
-                  <a href={formsApi.download(result.form_id)} download
+                  <button onClick={downloadFilledForm} disabled={downloading}
                     className="btn-primary inline-flex">
-                    <Download size={16} />
+                    {downloading ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
                     Download {result.client_name}.xlsx
-                  </a>
+                  </button>
                   <button onClick={exportToGoogle} disabled={exporting}
                     className="btn-secondary inline-flex text-green-700 bg-green-50 border-green-200 hover:bg-green-100">
                     {exporting ? <Loader2 size={16} className="animate-spin" /> : <FileSpreadsheet size={16} />}
@@ -1088,9 +1126,10 @@ export default function FillForm() {
                     </div>
                     <div className="flex items-center gap-2">
                       {doc.has_file && (
-                        <a href={doc.download_url} download className="btn-ghost text-xs py-1 px-2">
-                          <Download size={13} /> Download
-                        </a>
+                        <button onClick={() => downloadDoc(doc)} disabled={downloadingDocId === doc.id}
+                          className="btn-ghost text-xs py-1 px-2">
+                          {downloadingDocId === doc.id ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />} Download
+                        </button>
                       )}
                       {doc.sharepoint_link && (
                         <a href={doc.sharepoint_link} target="_blank" rel="noopener noreferrer"
@@ -1107,8 +1146,6 @@ export default function FillForm() {
               </div>
             </div>
           )}
-
-          <button onClick={reset} className="btn-secondary"><RotateCcw size={16} />Fill another form</button>
         </div>
       )}
 
