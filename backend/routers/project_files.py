@@ -8,7 +8,7 @@ import openpyxl, io, os, json, logging
 from datetime import datetime
 from services.doc_extractor import extract_text, chunk_text
 from services.vector_store import VectorStore
-from utils import sanitize_filename
+from utils import sanitize_filename, enforce_upload_size
 
 router = APIRouter()
 FILES_DIR = "uploads/project_files"
@@ -109,6 +109,7 @@ async def upload_file(
         safe = sanitize_filename(file.filename)
         dest = os.path.join(FILES_DIR, safe)
         contents = await file.read()
+        enforce_upload_size(len(contents))
         with open(dest, "wb") as f:
             f.write(contents)
         filename = safe
@@ -194,12 +195,27 @@ def download_file(file_id: int, db: Session = Depends(get_db)):
     if not os.path.exists(path): raise HTTPException(404, "File missing")
     return FileResponse(path, filename=pf.filename)
 
+# FIX (P0 -- stored XSS via file upload): serving an arbitrary uploaded file
+# "inline" lets the browser render it in this API's own origin using
+# whatever content-type it guesses from the extension. Upload has no file-type
+# restriction, so a file named e.g. "x.html" or "x.svg" containing
+# <script>...</script> would execute when this endpoint is hit directly (the
+# frontend's own extension whitelist for the preview button is client-side
+# only -- it doesn't stop someone from hitting this URL directly). Only ever
+# render inline for types that can't contain executable content; everything
+# else is forced to download instead.
+INLINE_SAFE_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp"}
+
+
 @router.get("/{file_id}/view")
 def view_file_inline(file_id: int, db: Session = Depends(get_db)):
     pf = db.query(ProjectFile).filter(ProjectFile.id == file_id).first()
     if not pf or not pf.filename: raise HTTPException(404, "File not found")
     path = os.path.join(FILES_DIR, pf.filename)
     if not os.path.exists(path): raise HTTPException(404, "File missing")
+    ext = os.path.splitext(pf.filename)[1].lower()
+    if ext not in INLINE_SAFE_EXTENSIONS:
+        return FileResponse(path, filename=pf.filename)
     return FileResponse(path, content_disposition_type="inline")
 
 @router.post("/add-sharepoint")

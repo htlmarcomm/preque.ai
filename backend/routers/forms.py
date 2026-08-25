@@ -1448,6 +1448,26 @@ def ai_fill_workbook(
     return all_fills, sheet_status, combined_map, match_summary, fill_sources, pending_project_tables
 
 
+# FIX (P0 -- formula injection / CWE-1236): the values written into output
+# cells here come from a mix of AI guesses, human-typed "learned answers"
+# (routers/agent.py save_learned_answer, no validation on the text), and
+# picked project-database records -- none of it fully trusted -- and the
+# resulting .xlsx is sent to real external clients to open. If any of those
+# values happened to start with =, +, -, or @, Excel treats the cell as a
+# live formula when opened (e.g. "=HYPERLINK(...)" or a DDE/webquery
+# payload), not literal text. A leading apostrophe is the standard,
+# file-format-level way to force Excel to store it as text instead --
+# Excel's own UI convention is that a value typed with a leading `'` is
+# treated as text with the quote itself hidden from display.
+FORMULA_INJECTION_PREFIXES = ('=', '+', '-', '@', '\t', '\r')
+
+
+def _excel_safe(value):
+    if isinstance(value, str) and value.startswith(FORMULA_INJECTION_PREFIXES):
+        return "'" + value
+    return value
+
+
 def write_filled_excel_multi(original_bytes: bytes, sheet_fills: dict) -> bytes:
     """
     Write filled values back to their correct sheets, preserving all formatting.
@@ -1478,13 +1498,13 @@ def write_filled_excel_multi(original_bytes: bytes, sheet_fills: dict) -> bytes:
                         anchor_cell.value is None or str(anchor_cell.value).strip() == ""
                     )
                     if anchor_is_blank:
-                        anchor_cell.value = value
+                        anchor_cell.value = _excel_safe(value)
                     else:
                         anchor_desc = f"{anchor_cell.coordinate}='{anchor_cell.value}'" if anchor_cell else "unknown"
                         print(f"[SKIP] {sheet_name}!{addr} is a merged-cell remnant whose anchor "
                               f"already holds label text ({anchor_desc}) -- refusing to overwrite it")
                 else:
-                    cell.value = value
+                    cell.value = _excel_safe(value)
             except Exception as e:
                 print(f"[WARN] Could not write {sheet_name}!{addr}: {e}")
     out = io.BytesIO()
@@ -1497,7 +1517,7 @@ def write_filled_excel(original_bytes: bytes, sheet_name: str, cell_fills: dict)
     ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.active
     for addr, value in cell_fills.items():
         try:
-            ws[addr] = value
+            ws[addr] = _excel_safe(value)
         except Exception as e:
             print(f"[WARN] Could not write {addr}: {e}")
     out = io.BytesIO()

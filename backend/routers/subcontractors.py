@@ -77,8 +77,10 @@ def delete_subcontractor(sub_id: int, db: Session = Depends(get_db)):
 
 @router.post("/import-csv")
 async def import_subcontractors_csv(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    from utils import enforce_upload_size
     contents = await file.read()
-    
+    enforce_upload_size(len(contents))
+
     try:
         if file.filename.endswith(".csv"):
             df = pd.read_csv(io.BytesIO(contents))

@@ -76,9 +76,10 @@ def process_excel_form(
     5. Write values back to the exact sheet + cell they belong to
     Works for single-sheet OR multi-sheet (e.g. 13-tab) forms alike.
     """
-    from utils import sanitize_filename
+    from utils import sanitize_filename, enforce_upload_size
 
     file_bytes = file.file.read()
+    enforce_upload_size(len(file_bytes))
     safe_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{sanitize_filename(file.filename)}"
     with open(os.path.join(UPLOAD_DIR, safe_name), "wb") as f:
         f.write(file_bytes)
@@ -236,7 +237,10 @@ def process_image_form(
     db: Session = Depends(get_db)
 ):
     """Screenshot of portal â†’ GPT-4o reads it visually â†’ returns label:value pairs."""
+    from utils import enforce_upload_size
+
     file_bytes = file.file.read()
+    enforce_upload_size(len(file_bytes))
     content_type = file.content_type or "image/jpeg"
     company_context = build_company_context(db)
     b64 = base64.standard_b64encode(file_bytes).decode("utf-8")

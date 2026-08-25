@@ -1,5 +1,18 @@
 import os
 import re
+from fastapi import HTTPException
+
+# Nothing legitimately uploaded to this app (a PQ form, a compliance
+# certificate, a project register) should ever approach this size. Without
+# a cap, an unauthenticated-in-practice (shared key, shipped in the
+# frontend bundle) endpoint accepting uploads is an easy disk/memory
+# exhaustion vector once this is reachable from the internet.
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25MB
+
+
+def enforce_upload_size(num_bytes: int, max_bytes: int = MAX_UPLOAD_BYTES):
+    if num_bytes > max_bytes:
+        raise HTTPException(413, f"File too large (max {max_bytes // (1024 * 1024)}MB)")
 
 
 def normalize_field_key(field_label: str) -> str:

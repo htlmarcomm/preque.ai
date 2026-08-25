@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from models.database import get_db, ProjectDataRecord, ProjectDataColumn, ProjectDataSheet
-from utils import sanitize_filename
+from utils import sanitize_filename, enforce_upload_size
 import openpyxl
 
 router = APIRouter()
@@ -34,6 +34,7 @@ def detect_header_row(ws, max_scan_rows=10):
 @router.post("/import")
 async def import_project_data(file: UploadFile = File(...), db: Session = Depends(get_db)):
     contents = await file.read()
+    enforce_upload_size(len(contents))
     wb = openpyxl.load_workbook(io.BytesIO(contents), data_only=True)
     
     upload_dir = "uploads/project_data_imports"

@@ -3,10 +3,10 @@ from sqlalchemy.orm import Session
 from models.database import get_db, ProjectFile, DocumentChunk
 from pydantic import BaseModel
 from typing import Optional, List
-import os, shutil, logging
+import os, logging
 from services.doc_extractor import extract_text, chunk_text
 from services.vector_store import VectorStore
-from utils import sanitize_filename
+from utils import sanitize_filename, enforce_upload_size
 
 router = APIRouter()
 UPLOAD_DIR = "uploads/project_files"
@@ -87,8 +87,10 @@ async def upload_document(
     if file:
         safe_name = sanitize_filename(file.filename)
         dest = os.path.join(UPLOAD_DIR, safe_name)
+        contents = await file.read()
+        enforce_upload_size(len(contents))
         with open(dest, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+            f.write(contents)
         filename = safe_name
 
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []

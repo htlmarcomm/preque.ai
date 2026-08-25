@@ -4,7 +4,7 @@ from models.database import get_db, CompanyField
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
-import openpyxl, io, json, os
+import openpyxl, io, json, os, re
 from utils import normalize_field_key
 
 router = APIRouter()
@@ -98,7 +98,9 @@ def dump_all(db: Session = Depends(get_db)):
 @router.post("/import-excel")
 async def import_from_excel(file: UploadFile = File(...), db: Session = Depends(get_db)):
     import re as _re
+    from utils import enforce_upload_size
     contents = await file.read()
+    enforce_upload_size(len(contents))
     wb = openpyxl.load_workbook(io.BytesIO(contents), data_only=True)
     ws = wb.active
     imported = 0
@@ -200,13 +202,106 @@ async def import_from_excel(file: UploadFile = File(...), db: Session = Depends(
         result["errors"] = errors[:10]  # return first 10 errors max
     return result
 
+# FIX (P0 -- import silently produces zero rows for common real-world
+# headers): this used to match each column header against a single
+# hardcoded substring per field ("name of project", "start", "phone"...).
+# Real client-supplied templates vary a lot -- "Name of the project" (note
+# "the") never matched "name of project", "Date of commencement" never
+# matched "start", "Mobile No." never matched "phone"/"contact", and
+# "Name and address of the organisation" never matched "client" at all.
+# Since project_name is required for a row to be kept at all, a template
+# using any of these ordinary phrasings imported ZERO rows with no visible
+# error. Each field now has a list of real-world phrasings, matched via the
+# same fuzzy scorer (with the same length-aware threshold + ambiguity guard
+# to avoid false positives) already proven on the Fill Form project-table
+# picker for exactly this class of problem.
+PROJECT_REFERENCE_FIELD_KEYWORDS = {
+    "project_name": ["project name", "name of project", "name of the project", "project title"],
+    "client_name": ["client name", "customer name", "organisation", "organization", "employer", "name and address of the organisation"],
+    "region": ["region", "zone"],
+    "location": ["location", "town", "locality"],
+    "area_sqft": ["area sqft", "area (sqft)", "area"],
+    "consultant": ["consultant", "architect"],
+    "pmc": ["pmc"],
+    "project_sector": ["sector"],
+    "project_type": ["project type", "type of project"],
+    "project_value": ["project value", "project cost", "contract value", "value of project", "value"],
+    "status": ["status"],
+    "start_date": ["start date", "date of commencement", "commencement"],
+    "end_date": ["end date", "completion date", "date of completion"],
+    "client_rep_designation": ["designation"],
+    "client_rep_email": ["email"],
+    "client_rep_phone": ["phone", "contact", "mobile", "landline"],
+    "certifications": ["certification", "certificate"],
+}
+
+
+PLACEHOLDER_VALUES = {"-", "--", "na", "n/a", "nil", "none", "nan", "."}
+
+
+def _is_placeholder(val_str: str) -> bool:
+    """Source spreadsheets commonly fill an unknown cell with a bare '-' or
+    'NA' rather than leaving it empty -- storing that literally as e.g. a
+    client rep name is worse than just leaving the field blank."""
+    return val_str.strip().lower() in PLACEHOLDER_VALUES
+
+
+def _best_project_reference_field(header_text: str) -> str | None:
+    try:
+        from rapidfuzz import fuzz
+    except ImportError:
+        fuzz = None
+
+    def norm(s):
+        return re.sub(r'[^a-z0-9]+', ' ', str(s or '').lower()).strip()
+
+    candidate = norm(header_text)
+    if not candidate:
+        return None
+
+    candidate_tokens = candidate.split()
+    required = 92 if len(candidate_tokens) <= 2 else 82
+
+    # (score, keyword length in tokens, field) for every keyword that clears
+    # the threshold -- a header can legitimately contain a full match for
+    # more than one field's keyword at once (e.g. "Name of the Project
+    # (with client name)" scores 100 against BOTH "name of the project" and
+    # "client name"), so length is tracked to break that tie below.
+    hits = []
+    for field, keywords in PROJECT_REFERENCE_FIELD_KEYWORDS.items():
+        for kw in keywords:
+            kw_norm = norm(kw)
+            score = fuzz.token_set_ratio(kw_norm, candidate) if fuzz else (100 if kw_norm in candidate else 0)
+            if score >= required:
+                hits.append((score, len(kw_norm.split()), field))
+
+    if not hits:
+        return None
+
+    # Prefer the highest score; among near-ties, prefer the longer (more
+    # specific, less likely to be a coincidental partial mention) keyword.
+    hits.sort(key=lambda x: (-x[0], -x[1]))
+    best_score, best_len, best_field = hits[0]
+
+    # Ambiguity guard: a DIFFERENT field whose match is both similarly
+    # strong AND at least as specific means this is a genuine coin flip --
+    # refuse rather than risk misfiling the column.
+    for score, kw_len, field in hits[1:]:
+        if field != best_field and (best_score - score) < 8 and kw_len >= best_len:
+            return None
+
+    return best_field
+
+
 @router.post("/import-projects")
 async def import_projects_from_excel(file: UploadFile = File(...), db: Session = Depends(get_db)):
     from models.database import ProjectReference
+    from utils import enforce_upload_size
     contents = await file.read()
+    enforce_upload_size(len(contents))
     wb = openpyxl.load_workbook(io.BytesIO(contents), data_only=True)
     imported = 0
-    
+
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
         headers = []
@@ -214,48 +309,59 @@ async def import_projects_from_excel(file: UploadFile = File(...), db: Session =
             if i == 0:
                 headers = [str(h).strip().lower() if h else "" for h in row]
                 continue
-                
+
             if not any(row):
                 continue
-                
+
             row_data = {}
             for h, val in zip(headers, row):
                 if not h: continue
                 val_str = str(val).strip() if val is not None else ""
-                if "project name" in h or "name of project" in h: row_data["project_name"] = val_str
-                elif "client" in h and "rep" not in h: row_data["client_name"] = val_str
-                elif "region" in h: row_data["region"] = val_str
-                elif "location" in h: row_data["location"] = val_str
-                elif "area" in h: row_data["area_sqft"] = val_str
-                elif "consultant" in h: row_data["consultant"] = val_str
-                elif "pmc" in h: row_data["pmc"] = val_str
-                elif "sector" in h: row_data["project_sector"] = val_str
-                elif "type" in h: row_data["project_type"] = val_str
-                elif "value" in h: row_data["project_value"] = val_str
-                elif "status" in h: row_data["status"] = val_str
-                elif "start" in h: row_data["start_date"] = val_str
-                elif "end" in h or "completion" in h: row_data["end_date"] = val_str
-                elif "rep" in h or "representative" in h:
-                    import re
-                    if re.search(r'name|designation|email|contact', val_str, re.IGNORECASE) and (":" in val_str or "\n" in val_str):
-                        name_m = re.search(r'Name\s*[:\-]?\s*(.*?)(?:Designation|$)', val_str, re.IGNORECASE | re.DOTALL)
-                        if name_m: row_data["client_rep_name"] = name_m.group(1).strip()
-                        
-                        desig_m = re.search(r'Designation\s*[:\-]?\s*(.*?)(?:Email|$)', val_str, re.IGNORECASE | re.DOTALL)
-                        if desig_m: row_data["client_rep_designation"] = desig_m.group(1).strip()
-                        
-                        email_m = re.search(r'Email(?: ID)?\s*[:\-]?\s*(.*?)(?:Contact|$)', val_str, re.IGNORECASE | re.DOTALL)
-                        if email_m: row_data["client_rep_email"] = email_m.group(1).strip()
-                        
+                # The combined "client rep" mega-column (name/designation/email/
+                # phone all in one cell) is a structural pattern, not a field
+                # name -- check it before the generic fuzzy field match.
+                # FIX (P0 -- designation overwrote the correctly-parsed name):
+                # a header like "Designation of client representative" also
+                # contains "representative", so it used to trip this branch
+                # too. Its value ("(Procurement Lead)") doesn't look like a
+                # combined name/designation/email/phone blob, so it fell into
+                # the "else: treat whole value as the rep's name" case and
+                # clobbered whatever "Name of the client representative"
+                # (processed earlier in the same row) had already set.
+                # Requiring "name" alongside "rep"/"representative" limits
+                # this branch to genuinely name-shaped columns; a column
+                # that's specifically about designation/phone/email now falls
+                # through to the ordinary fuzzy field match instead.
+                if ("rep" in h or "representative" in h) and "name" in h:
+                    # FIX: val_str is already .strip()'d above, so a trailing
+                    # "\n" that used to gate this extraction (the old check
+                    # was `":" in val_str or "\n" in val_str`) is gone before
+                    # it's ever inspected -- "Name - Naveen Sharma\n" reaches
+                    # here as "Name - Naveen Sharma" with no newline and no
+                    # colon, so the gate always failed and the raw
+                    # "Name - Naveen Sharma" got stored verbatim instead of
+                    # just "Naveen Sharma". Try the "Name: ..." extraction
+                    # directly instead of gating on a separator character
+                    # that may or may not have survived stripping.
+                    name_m = re.search(r'Name\s*[:\-]?\s*(.*?)(?:\s*Designation|\s*Email|\s*Contact|$)', val_str, re.IGNORECASE | re.DOTALL)
+                    if name_m and name_m.group(1).strip():
+                        row_data["client_rep_name"] = name_m.group(1).strip()
+                        desig_m = re.search(r'Designation\s*[:\-]?\s*(.*?)(?:\s*Email|\s*Contact|$)', val_str, re.IGNORECASE | re.DOTALL)
+                        if desig_m and desig_m.group(1).strip(): row_data["client_rep_designation"] = desig_m.group(1).strip()
+
+                        email_m = re.search(r'Email(?: ID)?\s*[:\-]?\s*(.*?)(?:\s*Contact|$)', val_str, re.IGNORECASE | re.DOTALL)
+                        if email_m and email_m.group(1).strip(): row_data["client_rep_email"] = email_m.group(1).strip()
+
                         phone_m = re.search(r'Contact(?: Number)?\s*[:\-]?\s*(.*)', val_str, re.IGNORECASE | re.DOTALL)
-                        if phone_m: row_data["client_rep_phone"] = phone_m.group(1).strip()
-                    else:
+                        if phone_m and phone_m.group(1).strip(): row_data["client_rep_phone"] = phone_m.group(1).strip()
+                    elif not _is_placeholder(val_str):
                         row_data["client_rep_name"] = val_str
-                elif "designation" in h: row_data["client_rep_designation"] = val_str
-                elif "email" in h: row_data["client_rep_email"] = val_str
-                elif "phone" in h or "contact" in h: row_data["client_rep_phone"] = val_str
-                elif "cert" in h: row_data["certifications"] = val_str
-    
+                    continue
+
+                field = _best_project_reference_field(h)
+                if field and val_str and not _is_placeholder(val_str):
+                    row_data[field] = val_str
+
             if not row_data.get("project_name"):
                 continue
                 

@@ -14,3 +14,7 @@ uploads/
 *.db
 *.log
 backend/seed_data/
+backend/google-credentials.json
+*credentials*.json
+*.pem
+*.key
