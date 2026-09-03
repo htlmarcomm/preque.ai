@@ -104,11 +104,18 @@ Answer THREE questions about this sheet and return a single JSON object.
    headers or preceding text like "Major work done", "Ongoing projects", "Projects completed",
    "Past performance", "Experience Record". If it asks for "Project Cost", "Duration of
    Project", "Scope of Work", "Location", "Client Name", treat it as a project table
-   regardless of the exact heading. Look for consecutive numbered cells in a single column
-   (e.g. [C7]='1', [C8]='2') indicating table rows, or clear repeating column headers. Also
-   scan nearby text for an explicit max row count instruction (e.g. "list only 10 projects at
-   max", "top 5 projects", "maximum 3 references") — extract that number if present, else null.
-   If not a project table, just return {{"is_project_table": false}}.
+   regardless of the exact heading. A genuine project table has MULTIPLE distinct value
+   columns/fields per row (e.g. project name AND client AND value AND date together) that
+   repeat identically across rows. A consecutive numbered column (e.g. [A6]='1', [A7]='2') is
+   NOT on its own evidence of a project table — a plain numbered list of unrelated single-fact
+   questions (like a "GENERAL INFORMATION" section numbering "1. Name of the firm", "2.
+   Registration No.", "3. Year of Establishment") uses the exact same numbering pattern but is
+   NOT a project table; each such row asks a different, unrelated single question with exactly
+   ONE answer cell, not a repeating set of project fields. Only classify as a project table when
+   the numbered rows also share the same repeating column structure asking for the same kind of
+   project/client facts. Also scan nearby text for an explicit max row count instruction (e.g.
+   "list only 10 projects at max", "top 5 projects", "maximum 3 references") — extract that
+   number if present, else null. If not a project table, just return {{"is_project_table": false}}.
 
 Return ONLY this JSON object, no markdown, no explanation:
 {{
