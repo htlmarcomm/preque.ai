@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     fonts-dejavu-core \
     curl \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app/backend
