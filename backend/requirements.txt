@@ -19,7 +19,6 @@ python-docx>=1.1.0
 sentence-transformers>=3.0.0
 numpy
 torch
-tf-keras
 msal
 requests
 pandas

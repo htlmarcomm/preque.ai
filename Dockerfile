@@ -35,6 +35,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app/backend
 
 COPY backend/requirements.txt ./
+# CPU-only torch build -- the default PyPI wheel pulls in ~2GB of nvidia
+# CUDA/cuDNN packages this container will never use (no GPU on Railway/
+# Oracle/most hosts). Installing this first satisfies sentence-transformers'
+# torch dependency before requirements.txt gets to it.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/ ./
