@@ -406,9 +406,25 @@ def find_field_value_in_record(rec_data: dict, field_key: str, column_labels: di
 
     normalized_keywords = [norm(kw) for kw in keywords]
 
+    # FIX (P0 -- wrong data written to a real cell): a merged source column
+    # like "Location/Area (sq.ft)" fuzzy-matches the "location" keyword
+    # perfectly well (it literally contains the word "Location"), but its
+    # actual value is a bare number ("900.0") -- an area figure, not a place
+    # name. Text-shaped fields should never accept a purely numeric value;
+    # if this is the only candidate, better to leave the cell blank (or fall
+    # through to the duration-from-dates fallback below) than silently write
+    # a square-footage number into a "Location" cell.
+    TEXT_ONLY_FIELDS = {"location", "client_name", "project_name", "scope_of_work", "contact_name", "contact_designation"}
+    NUMERIC_RE = re.compile(r'^[\s\d.,]+$')
+
+    def is_purely_numeric(v: str) -> bool:
+        return bool(NUMERIC_RE.match(v.strip())) and any(c.isdigit() for c in v)
+
     best_value, best_score, second_best_score = None, 0, 0
     for col_key, value in (rec_data or {}).items():
         if not value or not isinstance(value, str) or not value.strip():
+            continue
+        if field_key in TEXT_ONLY_FIELDS and is_purely_numeric(value):
             continue
         label = (column_labels or {}).get(col_key) or col_key.replace('_', ' ')
         candidate = norm(label)

@@ -36,6 +36,37 @@ If a field only asks for attachments, certificates, or licenses and does not nam
 Return ONLY the JSON array, no markdown."""
 
 
+_ROMAN_HEADING_RE = re.compile(r'^[IVXLCDM]{1,4}\s*[\.\)\-:]')
+_STOP_LABELS = {
+    "remarks", "remark", "sr no", "sr no.", "s no", "s.no", "s.no.",
+    "particulars", "particular", "details", "description", "notes", "note",
+}
+
+
+def _is_junk_label(s: str) -> bool:
+    """
+    Mirrors field_matcher.extract_candidates_from_map's is_usable_label guard.
+    FIX (unknown-fields list polluted with section headers): agent.py's own
+    adjacent-label lookup below has no equivalent filter, so a roman-numeral
+    section heading like "I . GENERAL INFORMATION" (sitting in an unmerged
+    cell, so it never gets wrapped as "--- Section: ... ---") was leaking
+    into the "Needs your input" review list as if it were a real unanswered
+    question -- consuming a slot in the capped 15-item list with a heading
+    nobody can actually answer, instead of a genuine blank field.
+    """
+    if not s:
+        return True
+    s = s.strip()
+    if s.startswith("--- Section:") and s.endswith("---"):
+        return False  # legitimate label, not junk
+    if _ROMAN_HEADING_RE.match(s):
+        return True
+    letters = [c for c in s if c.isalpha()]
+    if len(s) > 20 and letters and (sum(1 for c in letters if c.isupper()) / len(letters)) > 0.85:
+        return True
+    return s.lower() in _STOP_LABELS
+
+
 def _get_adjacent_label_factory(cell_label_map):
     def get_adjacent_label(coord):
         match = re.match(r'^([A-Z]+)(\d+)$', coord)
@@ -147,6 +178,8 @@ def process_excel_form(
         raw_unknown = [c for c in all_empty if c not in fills]
         for c in raw_unknown:
             lbl = get_adjacent_label(c)
+            if lbl and _is_junk_label(lbl):
+                continue
             tagged = f"{sheet_name} - {lbl}" if lbl else f"Cell {c}"
             if lbl and lbl != c and tagged not in [u["label"] for u in unknown_fields_objs] and lbl not in [u["label"].split(" - ")[-1] for u in unknown_fields_objs]:
                 unknown_fields_objs.append({"label": tagged, "cell": f"{sheet_name}!{c}"})
