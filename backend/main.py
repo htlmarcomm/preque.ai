@@ -4,14 +4,30 @@ load_dotenv()
 import os
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from routers import company_data, company_search, forms, documents, agent, project_files, workspace, google, search, subcontractors, project_data, project_picker
 from models.database import engine, Base
-from auth import require_api_key
+from auth import require_api_key, client_ip
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="PreQue Automation API", version="1.0.0")
+
+# SECURITY FIX: no rate limiting existed anywhere -- someone holding the
+# (frontend-embedded, effectively public) API key could hammer any endpoint
+# without limit. This throttles per source IP regardless of whether the key
+# they're using is valid, which the auth.py lockout alone doesn't cover
+# (that one only throttles INVALID keys). key_func reuses auth.py's
+# client_ip so both defenses agree on who "one client" actually is behind
+# Railway/Caddy's proxy, instead of slowapi's default (which would see only
+# the proxy's own IP and rate-limit everyone as a single client).
+limiter = Limiter(key_func=client_ip, default_limits=["120/minute"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 app.add_middleware(
     CORSMiddleware,

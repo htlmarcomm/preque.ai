@@ -79,20 +79,15 @@ def delete_field(field_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"deleted": field_id}
 
-# ── BULK DATA ─────────────────────────────────────────────────────────────
-@router.get("/dump")
-def dump_all(db: Session = Depends(get_db)):
-    """Returns all company data as flat key:value dict for agent use."""
-    fields = db.query(CompanyField).all()
-    result = {}
-    for f in fields:
-        result[f.field_key] = {
-            "label": f.field_label,
-            "value": f.value or "",
-            "category": f.category,
-            "document_link": f.document_link or ""
-        }
-    return result
+# SECURITY: a `/dump` endpoint that returned every company_fields row (GSTIN,
+# PAN, banking limits, financials -- everything) as one unauthenticated-in-
+# practice GET used to live here. Nothing in this codebase called it -- not
+# the frontend, not build_company_context (which queries the DB directly) --
+# it was pure dead code that happened to also be the single highest-value
+# target in the app: anyone with the shared API key (baked into the public
+# frontend JS bundle, readable via view-source by any visitor) could
+# exfiltrate the entire company dataset in one request. Removed rather than
+# access-restricted since nothing depends on it.
 
 # ── IMPORT FROM EXCEL ─────────────────────────────────────────────────────
 @router.post("/import-excel")

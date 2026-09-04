@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Form
 from sqlalchemy.orm import Session
 from models.database import get_db, FilledForm
 from routers.forms import OUTPUT_DIR, UPLOAD_DIR
@@ -20,7 +20,11 @@ def get_google_drive_service():
     return build('drive', 'v3', credentials=creds)
 
 @router.post("/export-form/{form_id}")
-def export_form_to_google_sheets(form_id: int, db: Session = Depends(get_db)):
+def export_form_to_google_sheets(
+    form_id: int,
+    recipient_email: str = Form(default=None),
+    db: Session = Depends(get_db)
+):
     form = db.query(FilledForm).filter(FilledForm.id == form_id).first()
     if not form: raise HTTPException(404, "Form not found")
     
@@ -57,16 +61,35 @@ def export_form_to_google_sheets(form_id: int, db: Session = Depends(get_db)):
         
         file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
 
-        # Anyone with the link can view. NOT 'writer' -- these exports contain
-        # GSTIN/PAN/financials, so leaving them world-editable indefinitely is
-        # a needless risk. If a specific recipient needs edit access, share
-        # that explicitly from Drive rather than opening it to anyone.
-        permission = {
-            'type': 'anyone',
-            'role': 'reader',
-        }
-        service.permissions().create(fileId=file.get('id'), body=permission).execute()
-        
-        return {"link": file.get('webViewLink')}
+        # SECURITY FIX: this used to always grant {'type': 'anyone', 'role':
+        # 'reader'} -- world-viewable, forever, no expiration, no way to know
+        # if the link leaked. These exports contain GSTIN/PAN/financials.
+        # Now: if a specific recipient's email is given, share with THAT
+        # person only (Google enforces sign-in as that account to view it) --
+        # this is the normal path and also triggers Drive's own "shared with
+        # you" notification email, so no separate link-copying step is
+        # needed. Only fall back to the old world-readable link if no
+        # recipient was provided, since the app has no login/identity system
+        # to know who's asking otherwise -- removing sharing entirely would
+        # make the returned link unusable to anyone, including the person
+        # who just triggered the export.
+        if recipient_email:
+            permission = {
+                'type': 'user',
+                'role': 'reader',
+                'emailAddress': recipient_email,
+            }
+            service.permissions().create(
+                fileId=file.get('id'), body=permission,
+                sendNotificationEmail=True
+            ).execute()
+        else:
+            permission = {
+                'type': 'anyone',
+                'role': 'reader',
+            }
+            service.permissions().create(fileId=file.get('id'), body=permission).execute()
+
+        return {"link": file.get('webViewLink'), "shared_with": recipient_email or "anyone with the link"}
     except Exception as e:
         raise HTTPException(500, f"Google Drive upload failed: {str(e)}")

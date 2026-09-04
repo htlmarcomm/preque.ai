@@ -50,6 +50,21 @@ COPY --from=frontend-build /app/frontend/dist ./static
 # DATABASE_URL=sqlite:///./uploads/preque.db so a single volume covers both.
 RUN mkdir -p uploads/forms uploads/outputs uploads/project_files uploads/project_data_imports uploads/outputs
 
+# SECURITY FIX: this container used to run as root with no USER directive --
+# standard defense-in-depth gap. If any dependency here (LibreOffice,
+# poppler, a Python package) ever had an exploitable bug, root-in-container
+# is a bigger blast radius than it needs to be for a process that only needs
+# to read/write its own uploads dir and listen on 8000. -m creates a real
+# home dir (/home/appuser) since LibreOffice's headless conversion needs a
+# writable HOME for its profile -- it errors out without one. chown happens
+# BEFORE the USER switch, and before any `docker run -v ...` volume mount
+# would attach at /app/backend/uploads, so a fresh named volume inherits
+# this ownership on first initialization (Docker copies the image's existing
+# dir permissions into a brand-new volume).
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+ENV HOME=/home/appuser
+
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -f http://127.0.0.1:8000/api/health || exit 1

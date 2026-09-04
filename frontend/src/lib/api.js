@@ -109,7 +109,11 @@ export const formsApi = {
   get: (id) => api.get(`/api/forms/${id}`),
   download: (id, filename) => downloadFile(`/api/forms/${id}/download`, filename),
   preview: (id) => api.get(`/api/forms/${id}/preview`),
-  exportToGoogleSheets: (id) => api.post(`/api/google/export-form/${id}`),
+  exportToGoogleSheets: (id, recipientEmail) => {
+    const formData = new FormData()
+    if (recipientEmail) formData.append('recipient_email', recipientEmail)
+    return api.post(`/api/google/export-form/${id}`, formData)
+  },
 }
 
 // Project Files ("File Cabinet")

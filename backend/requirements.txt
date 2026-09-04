@@ -22,3 +22,4 @@ torch
 msal
 requests
 pandas
+slowapi>=0.1.9

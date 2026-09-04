@@ -112,10 +112,19 @@ export default function FillForm() {
 
   const exportToGoogle = async () => {
     if (!result?.form_id) return
+    // SECURITY: sharing with a specific person's Google account (rather than
+    // "anyone with the link") keeps GSTIN/PAN/financial data in this export
+    // from being viewable by anyone who ever gets hold of the link. Cancel
+    // leaves recipientEmail null, which the backend still accepts -- falling
+    // back to the old world-readable link -- so this never blocks the export
+    // outright, just nudges toward the safer path.
+    const recipientEmail = window.prompt(
+      "Share with a specific Google account? Enter their email (recommended), or leave blank / Cancel to create a link anyone can view."
+    )
     setExporting(true)
     setError(null)
     try {
-      const res = await formsApi.exportToGoogleSheets(result.form_id)
+      const res = await formsApi.exportToGoogleSheets(result.form_id, recipientEmail || undefined)
       setGoogleSheetLink(res.data.link)
     } catch (e) {
       const detail = e.response?.data?.detail
