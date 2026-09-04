@@ -278,23 +278,42 @@ def process_image_form(
     company_context = build_company_context(db)
     b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
 
-    response = openai_client.chat.completions.create(
-        model=VISION_MODEL,
-        max_tokens=4000,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {
-                    "url": f"data:{content_type};base64,{b64}",
-                    "detail": "high"
-                }},
-                {"type": "text", "text": (
-                    f"{SCREENSHOT_FILL_PROMPT}\n\n"
-                    f"COMPANY DATA:\n{json.dumps(company_context, indent=2)}"
-                )}
-            ]
-        }]
-    )
+    # FIX (P0 -- bare 500 with no message on any vision failure): unlike the
+    # Excel path (ai_fill_workbook / analyze_sheet), which already tolerates
+    # per-sheet vision errors and falls back to Pass 1 matching, this call had
+    # zero error handling -- a rate limit, quota exhaustion, timeout, or any
+    # other provider hiccup propagated straight into FastAPI's generic 500,
+    # showing the user "Request failed with status code 500" with nothing
+    # actionable. Surface a clear, specific message instead.
+    try:
+        response = openai_client.chat.completions.create(
+            model=VISION_MODEL,
+            max_tokens=4000,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:{content_type};base64,{b64}",
+                        "detail": "high"
+                    }},
+                    {"type": "text", "text": (
+                        f"{SCREENSHOT_FILL_PROMPT}\n\n"
+                        f"COMPANY DATA:\n{json.dumps(company_context, indent=2)}"
+                    )}
+                ]
+            }]
+        )
+    except Exception as e:
+        msg = str(e)
+        if "429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower():
+            raise HTTPException(
+                status_code=503,
+                detail="The AI vision service has hit its request quota for now. Please try again in a few minutes, or use the Excel Form upload instead."
+            )
+        raise HTTPException(
+            status_code=502,
+            detail=f"The AI vision service failed to process this screenshot: {msg[:200]}"
+        )
 
     raw = response.choices[0].message.content.strip()
     if raw.startswith("```"):
