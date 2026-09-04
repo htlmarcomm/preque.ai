@@ -8,11 +8,35 @@ from fastapi.responses import FileResponse, JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
-from routers import company_data, company_search, forms, documents, agent, project_files, workspace, google, search, subcontractors, project_data, project_picker
-from models.database import engine, Base
-from auth import require_api_key, client_ip
+from routers import company_data, company_search, forms, documents, agent, project_files, workspace, google, search, subcontractors, project_data, project_picker, auth_router
+from models.database import engine, Base, SessionLocal, User
+from auth import require_user, client_ip, hash_password
 
 Base.metadata.create_all(bind=engine)
+
+# First-boot admin seeding: if no users exist yet, create one from
+# INITIAL_ADMIN_USERNAME/INITIAL_ADMIN_PASSWORD env vars so there's a way to
+# log in at all on a fresh deploy. Only runs when the users table is empty --
+# does nothing on every subsequent restart once at least one account exists.
+def _seed_initial_admin():
+    db = SessionLocal()
+    try:
+        if db.query(User).count() > 0:
+            return
+        username = os.getenv("INITIAL_ADMIN_USERNAME")
+        password = os.getenv("INITIAL_ADMIN_PASSWORD")
+        if not username or not password:
+            print("[auth] No users exist yet and INITIAL_ADMIN_USERNAME/INITIAL_ADMIN_PASSWORD "
+                  "are not set -- nobody will be able to log in until you set them and restart, "
+                  "or create a user directly in the database.")
+            return
+        db.add(User(username=username, password_hash=hash_password(password)))
+        db.commit()
+        print(f"[auth] Seeded initial admin user '{username}'.")
+    finally:
+        db.close()
+
+_seed_initial_admin()
 
 app = FastAPI(title="PreQue Automation API", version="1.0.0")
 
@@ -42,10 +66,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Every /api/* route requires the shared X-API-Key header (see auth.py) --
-# previously nothing in this app required any credential at all.
-api_auth = [Depends(require_api_key)]
+# Every /api/* route requires a valid per-user JWT (see auth.py) obtained by
+# logging in via /api/auth/login -- replaces the old model where a single
+# static key was compiled into the public frontend build and shared by every
+# visitor. auth_router itself is deliberately NOT in this list: /login has
+# to be reachable without already having a token.
+api_auth = [Depends(require_user)]
 
+app.include_router(auth_router.router, prefix="/api/auth", tags=["Auth"])
 app.include_router(company_data.router, prefix="/api/company", tags=["Company Data"], dependencies=api_auth)
 app.include_router(company_search.router, prefix="/api/company", tags=["Company Search"], dependencies=api_auth)
 app.include_router(forms.router, prefix="/api/forms", tags=["Forms"], dependencies=api_auth)

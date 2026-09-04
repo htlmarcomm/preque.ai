@@ -1,5 +1,23 @@
 import axios from 'axios'
 
+const TOKEN_KEY = 'preque_token'
+
+// SECURITY: this used to send a static X-API-Key baked into the build at
+// compile time (import.meta.env.VITE_API_KEY) -- meaning the "secret" was
+// actually public, readable by anyone who opened devtools on the live site.
+// Real per-user login (backend/routers/auth_router.py) replaces that: the
+// token below is obtained at runtime via POST /api/auth/login and lives
+// only in this browser's localStorage, never in the shipped JS.
+export function getToken() {
+  return localStorage.getItem(TOKEN_KEY)
+}
+export function setToken(token) {
+  localStorage.setItem(TOKEN_KEY, token)
+}
+export function clearToken() {
+  localStorage.removeItem(TOKEN_KEY)
+}
+
 // Local dev sets VITE_API_URL explicitly (frontend/.env) to point at the
 // separate backend dev server on :8000. In production the built frontend is
 // served by the backend itself from the same origin (see backend/main.py),
@@ -9,13 +27,36 @@ import axios from 'axios'
 export const api = axios.create({
   baseURL: import.meta.env.VITE_API_URL || '',
   timeout: 60000, // 60s default timeout
-  headers: import.meta.env.VITE_API_KEY ? { 'X-API-Key': import.meta.env.VITE_API_KEY } : {},
 })
+
+api.interceptors.request.use((config) => {
+  const token = getToken()
+  if (token) config.headers.Authorization = `Bearer ${token}`
+  return config
+})
+
+// A 401 means the token is missing/expired/invalid -- clear it and send the
+// user back to login rather than letting every page individually handle it.
+api.interceptors.response.use(
+  (res) => res,
+  (err) => {
+    if (err.response?.status === 401 && window.location.pathname !== '/login') {
+      clearToken()
+      window.location.href = '/login'
+    }
+    return Promise.reject(err)
+  }
+)
 
 // A plain <a href> or <img>/<iframe src> can't carry the X-API-Key header, so
 // any endpoint protected by the API key (all of /api/*) can't be linked to
 // directly -- it has to be fetched through the authenticated `api` client and
 // turned into a blob first. These two helpers are that path.
+
+export const authApi = {
+  login: (username, password) => api.post('/api/auth/login', { username, password }),
+  me: () => api.get('/api/auth/me'),
+}
 
 // Fetches an authenticated GET endpoint and triggers a normal browser
 // "Save As" for it.

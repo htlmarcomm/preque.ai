@@ -8,12 +8,14 @@ WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
-# No VITE_API_URL/VITE_API_KEY passed here on purpose -- the built bundle
-# talks to whatever origin it's served from (see frontend/src/lib/api.js).
-# The X-API-Key header itself is still required and is set via
-# VITE_API_KEY at build time if you DO want it baked in; see DEPLOY.md.
-ARG VITE_API_KEY=""
-ENV VITE_API_KEY=${VITE_API_KEY}
+# No VITE_API_URL passed here on purpose -- the built bundle talks to
+# whatever origin it's served from (see frontend/src/lib/api.js). There used
+# to be a VITE_API_KEY build-arg baked in here too, which was the actual
+# root cause of a real security finding: anyone who opened devtools on the
+# live site could read that "secret" straight out of the public JS bundle.
+# Auth is now real per-user login (backend/auth.py, routers/auth_router.py)
+# -- nothing secret is compiled into the build anymore, so there's nothing
+# to pass here.
 RUN npm run build
 
 # ---- Stage 2: backend + LibreOffice (needed to render each Excel sheet to

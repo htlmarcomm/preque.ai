@@ -1,5 +1,6 @@
+import { useEffect, useState } from 'react'
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
-import { Database, FileText, FolderOpen, History, Zap, Archive, Briefcase, Search, Users } from 'lucide-react'
+import { Database, FileText, FolderOpen, History, Zap, Archive, Briefcase, Search, Users, LogOut } from 'lucide-react'
 import FillForm from './pages/FillForm'
 import CompanyDB from './pages/CompanyDB'
 import FormHistory from './pages/FormHistory'
@@ -9,6 +10,8 @@ import Workspace from './pages/Workspace'
 import DocumentSearch from './pages/DocumentSearch'
 import SubContractors from './pages/SubContractors'
 import ProjectHistory from './pages/ProjectHistory'
+import Login from './pages/Login'
+import { authApi, getToken, clearToken } from './lib/api'
 
 // FIX: this page/route was missing entirely -- Documents.jsx is the only UI
 // that creates ProjectFile rows with source_module="document" (via
@@ -30,6 +33,37 @@ const navItems = [
 ]
 
 export default function App() {
+  // SECURITY: gates the whole app behind real login (see backend/auth.py +
+  // routers/auth_router.py) instead of the old model where a static key
+  // baked into the build meant anyone who found the URL was already "in".
+  // `checking` avoids a flash of the login screen while the token in
+  // localStorage (from a previous session) is still being verified.
+  const [username, setUsername] = useState(null)
+  const [checking, setChecking] = useState(true)
+
+  useEffect(() => {
+    const token = getToken()
+    if (!token) {
+      setChecking(false)
+      return
+    }
+    authApi.me()
+      .then((res) => setUsername(res.data.username))
+      .catch(() => clearToken())
+      .finally(() => setChecking(false))
+  }, [])
+
+  const logout = () => {
+    clearToken()
+    setUsername(null)
+  }
+
+  if (checking) return null
+
+  if (!username) {
+    return <Login onLogin={setUsername} />
+  }
+
   return (
     <BrowserRouter>
       <div className="min-h-screen flex">
@@ -50,7 +84,11 @@ export default function App() {
             ))}
           </nav>
           <div className="px-3 pt-4 border-t border-gray-100">
-            <p className="text-xs text-gray-400">Pre-Qual Automation</p>
+            <p className="text-xs text-gray-700 font-medium">{username}</p>
+            <button onClick={logout} className="mt-2 flex items-center gap-1.5 text-xs text-gray-400 hover:text-red-600 transition-colors">
+              <LogOut size={13} />Sign out
+            </button>
+            <p className="text-xs text-gray-300 mt-3">Pre-Qual Automation</p>
             <p className="text-xs text-gray-300 mt-0.5">v1.0 · HTL Internal</p>
           </div>
         </aside>
