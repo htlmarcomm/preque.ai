@@ -1,17 +1,22 @@
 ﻿from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Form
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
-from models.database import get_db, CompanyField, FilledForm
+from models.database import (
+    get_db, CompanyField, FilledForm,
+    ProjectDataRecord, ProjectReference, FinancialRecord, ProjectFile
+)
 from routers.forms import (
     ai_fill_workbook, write_filled_excel_multi,
     build_company_context, get_doc_checklist,
-    openai_client, VISION_MODEL, UPLOAD_DIR,
+    openai_client, VISION_MODEL, UPLOAD_DIR, OUTPUT_DIR,
     excel_to_all_sheet_maps, build_workbook_form_json,
     find_field_value_in_record
 )
 from typing import Optional
-import os, json, base64, re, shutil
+import os, json, base64, re, shutil, io
 from datetime import datetime
 from services.vector_store import VectorStore
+import openpyxl
 
 router = APIRouter()
 
@@ -596,5 +601,357 @@ def fill_project_table(
         "rows_filled": min(len(req.selected_ids), rows_available),
         "rows_available": rows_available
     }
+
+
+# ── RFP Questionnaire mode ───────────────────────────────────────────────────
+# A third Fill Form mode, distinct from the Excel cell-map and screenshot
+# paths above. This one is for a different, narrative-style pre-qual layout:
+# one sheet of {ID, Category, Evaluation Criterion, Evidence / Acceptance
+# Basis, Weight, VENDOR RESPONSE} rows, grouped into named sections (e.g.
+# "Technical Experience & Capability", "Stakeholder & Client References").
+# Per the actual database audit done for this exact file (ANJ x GC RFP
+# Siemens-Eon-Pune), most of these sections need a TABLE of real records as
+# supporting evidence (project history, client references, financials), not
+# a single cell value -- so each section gets its own generated sheet, and
+# the VENDOR RESPONSE column gets a short, honestly-grounded narrative that
+# says exactly how many real records back it up (or says plainly that the
+# data doesn't exist yet, for the confirmed gaps -- Pune headcount, ISO
+# 9001, VRF OEM, after-sales workshop -- rather than guessing).
+_INVALID_SHEET_CHARS = re.compile(r'[\[\]:*?/\\]')
+
+
+def _safe_sheet_name(name: str) -> str:
+    cleaned = _INVALID_SHEET_CHARS.sub('-', str(name or 'Section')).strip()
+    return (cleaned or 'Section')[:31]
+
+
+def _large_projects(db: Session):
+    records = db.query(ProjectDataRecord).all()
+    rows = []
+    for r in records:
+        d = r.data or {}
+        area = None
+        for k in ("project_area_in_sqft", "location_area_sq_ft", "area_sq_ft", "area_in_sqft"):
+            v = d.get(k)
+            if v:
+                try:
+                    area = float(str(v).replace(",", ""))
+                    break
+                except ValueError:
+                    pass
+        # Upper bound excludes obvious source-data entry errors (a few rows
+        # carry area values in the tens of millions of sqft -- no single MEP
+        # project is plausibly that size; the largest genuine entries here
+        # are ~10 lakh sqft). Without this, junk rows sort to the top of
+        # "biggest projects" and crowd out real, verifiable evidence.
+        if area and 200000 <= area <= 2000000:
+            rows.append({
+                "Project Name": d.get("project_name") or d.get("end_user") or r.primary_label,
+                "Client / End User": d.get("end_user") or d.get("client_name"),
+                "Area (Sq Ft)": area,
+                "Contract Value": d.get("contract_value_at_start") or d.get("wo_value_excl_gst"),
+                "Completion Date": d.get("end_date"),
+            })
+    rows.sort(key=lambda x: x["Area (Sq Ft)"] or 0, reverse=True)
+    cols = ["Project Name", "Client / End User", "Area (Sq Ft)", "Contract Value", "Completion Date"]
+    return cols, rows[:25]
+
+
+def _lab_rnd_projects(db: Session):
+    records = db.query(ProjectDataRecord).filter(ProjectDataRecord.search_text.contains("lab")).limit(200).all()
+    rows = []
+    for r in records:
+        d = r.data or {}
+        name = d.get("project_name") or d.get("end_user") or r.primary_label
+        if not name:
+            continue
+        rows.append({
+            "Project Name": name,
+            "Client / End User": d.get("end_user") or d.get("client_name"),
+            "Sector": d.get("job_sector"),
+            "Completion Date": d.get("end_date"),
+        })
+    cols = ["Project Name", "Client / End User", "Sector", "Completion Date"]
+    return cols, rows[:25]
+
+
+def _ongoing_projects(db: Session):
+    records = db.query(ProjectDataRecord).filter(ProjectDataRecord.source_file.contains("Ongoing")).limit(25).all()
+    rows = []
+    for r in records:
+        d = r.data or {}
+        if not (d.get("project_name") or d.get("client_name")):
+            continue
+        rows.append({
+            "Project Name": d.get("project_name") or d.get("client_name"),
+            "Start Date": d.get("start_date"),
+            "Expected Completion": d.get("end_date"),
+        })
+    return ["Project Name", "Start Date", "Expected Completion"], rows
+
+
+def _pmc_siemens_projects(db: Session):
+    records = db.query(ProjectDataRecord).filter(ProjectDataRecord.search_text.contains("siemens")).limit(25).all()
+    rows = []
+    for r in records:
+        d = r.data or {}
+        rows.append({
+            "Project Name": d.get("project_name") or d.get("client_name"),
+            "Client / End User": d.get("end_user") or d.get("client_name"),
+            "Location": d.get("location"),
+            "Value": d.get("contract_value_at_start") or d.get("wo_value_excl_gst"),
+        })
+    return ["Project Name", "Client / End User", "Location", "Value"], rows
+
+
+def _ehs_safety_fields(db: Session):
+    fields = db.query(CompanyField).filter(CompanyField.category.in_(["Compliance", "Manpower"])).all()
+    rows = [{"Field": f.field_label, "Value": f.value} for f in fields if f.value]
+    return ["Field", "Value"], rows
+
+
+def _financial_history(db: Session, metric_keys=None):
+    q = db.query(FinancialRecord)
+    if metric_keys:
+        q = q.filter(FinancialRecord.metric_key.in_(metric_keys))
+    else:
+        q = q.filter(FinancialRecord.metric_key.in_(["annual_turnover", "net_worth", "net_profit_after_tax", "total_assets"]))
+    records = q.order_by(FinancialRecord.fiscal_year.desc()).all()
+    rows = [{"Fiscal Year": r.fiscal_year, "Metric": r.metric_label, "Value": r.value, "Unit": r.unit} for r in records]
+    return ["Fiscal Year", "Metric", "Value", "Unit"], rows
+
+
+def _statutory_documents(db: Session):
+    docs = db.query(ProjectFile).filter(ProjectFile.source_module == "document").all()
+    rows = [{"Document": d.name, "Category": d.category, "Link": d.sharepoint_link or "Not yet linked"} for d in docs]
+    return ["Document", "Category", "Link"], rows
+
+
+def _client_references(db: Session):
+    refs = db.query(ProjectReference).filter(
+        ProjectReference.client_rep_name.isnot(None),
+        ProjectReference.client_rep_phone.isnot(None),
+    ).limit(25).all()
+    rows = [{
+        "Client Name": r.client_name, "Project": r.project_name,
+        "Contact Name": r.client_rep_name, "Designation": r.client_rep_designation,
+        "Phone": r.client_rep_phone, "Email": r.client_rep_email,
+    } for r in refs]
+    return ["Client Name", "Project", "Contact Name", "Designation", "Phone", "Email"], rows
+
+
+# FIX (P0 -- overclaiming support for questions the data doesn't actually
+# answer): a real MEP pre-qual RFP routinely bundles several UNRELATED asks
+# under one Category -- e.g. "Execution Planning & Resources" covers ongoing
+# projects (data exists), a Pune-specific headcount minimum (doesn't exist
+# anywhere in this database), AND an after-sales workshop requirement
+# (also doesn't exist). Dispatching purely on the row's CATEGORY, as an
+# earlier version of this did, wrote "Supported by 24 records..." into the
+# Pune-headcount row too -- true for a neighboring question, false for that
+# one. Every question now gets its own evidence lookup based on its actual
+# criterion/evidence text, checked in order from most specific to most
+# generic, so a category that mixes "have it" and "don't have it" questions
+# reports each one honestly instead of borrowing a neighbor's evidence.
+def _gather_evidence_for_question(category: str, criterion: str, evidence_text: str, db: Session):
+    text = f"{criterion or ''} {evidence_text or ''}".lower()
+    cat = (category or "").lower()
+
+    # -- Explicit, confirmed gaps: check these FIRST so they never fall
+    # through to a same-category generic match that would wrongly claim
+    # support (e.g. "Pune" + "Execution Planning" would otherwise match the
+    # ongoing-projects branch below). --
+    if "vrf" in text or (" oem" in text or text.startswith("oem")):
+        return ("VRF OEM Association", [], [])
+    if "pune" in text and any(k in text for k in ("personnel", "payroll", "staff", "employee")):
+        return ("Pune Office Staffing", [], [])
+    if any(k in text for k in ("after-sales", "after sales", "workshop")):
+        return ("After-Sales Service Team", [], [])
+    if "9001" in text or ("qms" in text and "iso" in text):
+        return ("QMS ISO 9001 Certification", [], [])
+    if "separate team" in text and any(k in text for k in ("testing", "commissioning", "handover")):
+        # The generic EHS/Quality fields (ISO 45001, safety/quality
+        # headcounts) don't confirm a DEDICATED T&C/handover team exists --
+        # that's a distinct organisational fact this database doesn't track.
+        return ("Dedicated Testing & Commissioning Team", [], [])
+
+    # -- Specific evidence types that DO exist -- checked before the
+    # generic per-category fallback so they don't get merged together. --
+    if "siemens" in text or ("pmc" in text and ("reputed" in text or "experience" in text)):
+        cols, rows = _pmc_siemens_projects(db)
+        return ("PMC & Siemens Client Experience", cols, rows)
+    if any(k in text for k in ("laboratory", " lab ", "lab/", "r&d", "critical environment")):
+        cols, rows = _lab_rnd_projects(db)
+        return ("Lab/R&D Project History", cols, rows)
+    if any(k in text for k in ("ongoing project", "workload", "current project", "current deployment")):
+        cols, rows = _ongoing_projects(db)
+        return ("Ongoing Projects", cols, rows)
+    if "turnover" in text:
+        cols, rows = _financial_history(db, metric_keys=["annual_turnover"])
+        return ("Turnover History", cols, rows)
+
+    # -- Generic per-category fallback for questions that don't hit any of
+    # the specific patterns above. --
+    if "technical" in cat or "experience" in cat or "capability" in cat:
+        cols, rows = _large_projects(db)
+        return ("Large-Scale Project History", cols, rows)
+    if "execution" in cat or "resource" in cat or "planning" in cat:
+        cols, rows = _ongoing_projects(db)
+        return ("Ongoing Projects", cols, rows)
+    if "ehs" in cat or "safety" in cat or "quality" in cat or "testing" in cat or "handover" in cat:
+        cols, rows = _ehs_safety_fields(db)
+        return ("EHS & Quality Records", cols, rows)
+    if "financial" in cat:
+        cols, rows = _financial_history(db)
+        return ("Financial Statements", cols, rows)
+    if "governance" in cat or "documentation" in cat:
+        cols, rows = _statutory_documents(db)
+        return ("Statutory Documents", cols, rows)
+    if "stakeholder" in cat or "reference" in cat or "client" in cat:
+        cols, rows = _client_references(db)
+        return ("Client References", cols, rows)
+
+    return (None, [], [])
+
+
+def _build_narrative(rows: list, sheet_name: str | None) -> str:
+    if not rows:
+        return ("No supporting data currently exists in the company database for this requirement. "
+                "This needs to be supplied manually before submission.")
+    return (f"Supported by {len(rows)} record(s) from HTL's project/company database. "
+            f"See the '{sheet_name}' sheet in this workbook for the full supporting detail.")
+
+
+@router.post("/process-rfp-questionnaire")
+def process_rfp_questionnaire(
+    client_name: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    from utils import sanitize_filename, enforce_upload_size
+
+    file_bytes = file.file.read()
+    enforce_upload_size(len(file_bytes))
+    safe_name = sanitize_filename(file.filename)
+
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+    ws = wb.worksheets[0]
+
+    # Locate the header row by finding "VENDOR RESPONSE" (or similar) --
+    # scans the first 10 rows since these RFP templates usually have a
+    # title/instructions banner above the real header.
+    header_row = None
+    col_map = {}
+    for row in ws.iter_rows(min_row=1, max_row=10):
+        found = {}
+        for cell in row:
+            if not cell.value:
+                continue
+            h = str(cell.value).upper()
+            if "RESPONSE" in h: found["response"] = cell.column
+            elif "CATEGORY" in h: found["category"] = cell.column
+            elif "CRITERION" in h: found["criterion"] = cell.column
+            elif "EVIDENCE" in h: found["evidence"] = cell.column
+            elif "WEIGHT" in h: found["weight"] = cell.column
+            elif h.strip() == "ID": found["id"] = cell.column
+        # Require "response" together with at least one other structural
+        # column on the SAME row before accepting it as the header -- a
+        # plain "RESPONSE" substring match alone also fires on instructional
+        # banner text above the real header (e.g. "...WE REQUIRE A WRITTEN
+        # RESPONSE..."), which isn't itself a header row.
+        if "response" in found and ("category" in found or "criterion" in found or "evidence" in found):
+            header_row = row[0].row
+            col_map = found
+            break
+
+    if header_row is None:
+        raise HTTPException(400, "Could not find a 'VENDOR RESPONSE' column in this sheet -- this endpoint expects the ID / Category / Evaluation Criterion / Evidence / Weight / VENDOR RESPONSE layout.")
+
+    questions = []
+    for r in range(header_row + 1, ws.max_row + 1):
+        crit_col = col_map.get("criterion") or col_map.get("evidence")
+        crit = ws.cell(row=r, column=crit_col).value if crit_col else None
+        if not crit:
+            continue
+        cat_col = col_map.get("category")
+        ev_col = col_map.get("evidence")
+        questions.append({
+            "row": r,
+            "category": (ws.cell(row=r, column=cat_col).value if cat_col else None) or "General",
+            "criterion": crit,
+            "evidence_text": ws.cell(row=r, column=ev_col).value if ev_col else None,
+        })
+
+    if not questions:
+        raise HTTPException(400, "No question rows found under the header row.")
+
+    # Cache per evidence-TYPE label (not per category) so two questions that
+    # both need e.g. "Ongoing Projects" share one sheet instead of each
+    # question re-running the query and creating a duplicate.
+    evidence_cache = {}
+    category_summary = {}
+    for q in questions:
+        label, columns, rows = _gather_evidence_for_question(q["category"], q["criterion"], q["evidence_text"], db)
+
+        if label not in evidence_cache:
+            sheet_name = None
+            if rows:
+                sheet_name = _safe_sheet_name(label)
+                base_name, n = sheet_name, 1
+                while sheet_name in wb.sheetnames:
+                    n += 1
+                    sheet_name = _safe_sheet_name(f"{base_name[:28]}-{n}")
+                evsheet = wb.create_sheet(sheet_name)
+                for ci, col_name in enumerate(columns, start=1):
+                    evsheet.cell(row=1, column=ci, value=col_name)
+                for ri, rec in enumerate(rows, start=2):
+                    for ci, col_name in enumerate(columns, start=1):
+                        evsheet.cell(row=ri, column=ci, value=rec.get(col_name))
+            evidence_cache[label] = (sheet_name, rows)
+
+        sheet_name, rows = evidence_cache[label]
+        narrative = _build_narrative(rows, sheet_name)
+        ws.cell(row=q["row"], column=col_map["response"], value=narrative)
+
+        cat_entry = category_summary.setdefault(q["category"], {"questions": 0, "evidence_types": {}})
+        cat_entry["questions"] += 1
+        cat_entry["evidence_types"][label or "None"] = {"evidence_rows": len(rows), "sheet_created": sheet_name}
+
+    out_buf = io.BytesIO()
+    wb.save(out_buf)
+    out_bytes = out_buf.getvalue()
+
+    out_filename = f"rfp_filled_{safe_name}"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(os.path.join(OUTPUT_DIR, out_filename), "wb") as f:
+        f.write(out_bytes)
+
+    form = FilledForm(
+        client_name=client_name,
+        form_type="rfp_questionnaire",
+        original_filename=safe_name,
+        filled_data={"category_summary": category_summary, "output_filename": out_filename},
+        unknown_fields=[],
+        doc_checklist=[],
+    )
+    db.add(form); db.commit(); db.refresh(form)
+
+    return {
+        "form_id": form.id,
+        "client_name": client_name,
+        "category_summary": category_summary,
+        "download_url": f"/api/agent/rfp-download/{form.id}",
+    }
+
+
+@router.get("/rfp-download/{form_id}")
+def download_rfp_result(form_id: int, db: Session = Depends(get_db)):
+    form = db.query(FilledForm).filter(FilledForm.id == form_id, FilledForm.form_type == "rfp_questionnaire").first()
+    if not form:
+        raise HTTPException(404, "Form not found")
+    out_filename = (form.filled_data or {}).get("output_filename")
+    path = os.path.join(OUTPUT_DIR, out_filename) if out_filename else None
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Output file missing")
+    return FileResponse(path, filename=out_filename)
 
 

@@ -277,6 +277,16 @@ export default function FillForm() {
     setLoading(true); setError(null)
     setStep(1)
     try {
+      if (mode === 'rfp') {
+        // Distinct output shape from the other two modes -- no per-field
+        // review or project-table picker, just a per-category evidence
+        // summary and a ready-to-download workbook -- so this jumps
+        // straight to a dedicated Output view (step 3) instead of Review.
+        const res = await agentApi.processRfpQuestionnaire(clientName, file)
+        setResult(res.data)
+        setStep(3)
+        return
+      }
       const res = mode === 'excel'
         ? await agentApi.processExcel(clientName, file)
         : await agentApi.processImage(clientName, file)
@@ -449,10 +459,11 @@ export default function FillForm() {
           </div>
 
           {/* Mode selection */}
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-3 gap-4">
             {[
               { id: 'excel', icon: FileSpreadsheet, title: 'Excel Form', desc: 'Upload .xlsx / .xls preque form received from client', color: 'text-green-600 bg-green-50' },
               { id: 'image', icon: Image, title: 'Portal Screenshot', desc: 'Upload screenshot of client\'s online pre-qual portal', color: 'text-purple-600 bg-purple-50' },
+              { id: 'rfp', icon: Database, title: 'RFP Questionnaire', desc: 'Narrative RFP (ID / Category / Criterion / Evidence / VENDOR RESPONSE) -- generates evidence sheets per section', color: 'text-orange-600 bg-orange-50' },
             ].map(({ id, icon: Icon, title, desc, color }) => (
               <button key={id} onClick={() => { setMode(id); setFile(null) }}
                 className={`card p-5 text-left transition-all hover:shadow-md ${mode === id ? 'ring-2 ring-brand-500' : ''}`}>
@@ -477,7 +488,7 @@ export default function FillForm() {
               onDrop={handleDrop}
             >
               <input ref={fileRef} type="file" className="hidden"
-                accept={mode === 'excel' ? '.xlsx,.xls' : 'image/*'}
+                accept={mode === 'image' ? 'image/*' : '.xlsx,.xls'}
                 onChange={e => handleFile(e.target.files[0])} />
               {file ? (
                 <div className="flex items-center justify-center gap-3">
@@ -492,8 +503,8 @@ export default function FillForm() {
               ) : (
                 <>
                   <Upload size={32} className="text-gray-300 mx-auto mb-3" />
-                  <p className="text-sm font-medium text-gray-700">Drop your {mode === 'excel' ? 'Excel form' : 'screenshot'} here</p>
-                  <p className="text-xs text-gray-400 mt-1">or click to browse · {mode === 'excel' ? '.xlsx / .xls' : 'PNG / JPG / WEBP'}</p>
+                  <p className="text-sm font-medium text-gray-700">Drop your {mode === 'image' ? 'screenshot' : 'Excel form'} here</p>
+                  <p className="text-xs text-gray-400 mt-1">or click to browse · {mode === 'image' ? 'PNG / JPG / WEBP' : '.xlsx / .xls'}</p>
                 </>
               )}
             </div>
@@ -1041,10 +1052,55 @@ export default function FillForm() {
           <div className="p-4 bg-green-50 border border-green-100 rounded-xl flex items-center gap-3">
             <CheckCircle2 size={20} className="text-green-600 shrink-0" />
             <div>
-              <p className="font-medium text-green-900 text-sm">Form complete for {result.client_name}</p>
-              <p className="text-xs text-green-700 mt-0.5">{result.auto_filled} fields auto-filled · {Object.keys(humanAnswers).length} filled manually</p>
+              <p className="font-medium text-green-900 text-sm">
+                {mode === 'rfp' ? `Evidence sheets generated for ${result.client_name}` : `Form complete for ${result.client_name}`}
+              </p>
+              {mode !== 'rfp' && (
+                <p className="text-xs text-green-700 mt-0.5">{result.auto_filled} fields auto-filled · {Object.keys(humanAnswers).length} filled manually</p>
+              )}
             </div>
           </div>
+
+          {/* For RFP Questionnaire mode — per-category evidence summary + download */}
+          {mode === 'rfp' && (
+            <div className="card p-5 space-y-4">
+              <h3 className="font-medium text-gray-900 flex items-center gap-2">
+                <Database size={17} className="text-orange-600" />
+                Per-section evidence summary
+              </h3>
+              <p className="text-xs text-gray-500 -mt-2">
+                Each section below became its own sheet in the output workbook, populated with real matching records.
+                A section with 0 records means the data genuinely doesn't exist yet in the company database —
+                the VENDOR RESPONSE column says so honestly rather than guessing.
+              </p>
+              <div className="space-y-3">
+                {Object.entries(result.category_summary || {}).map(([category, info]) => (
+                  <div key={category} className="border border-gray-100 rounded-lg p-3">
+                    <p className="font-medium text-sm text-gray-900">{category}</p>
+                    <p className="text-xs text-gray-400 mb-2">{info.questions} question(s)</p>
+                    <div className="space-y-1">
+                      {Object.entries(info.evidence_types || {}).map(([label, ev]) => (
+                        <div key={label} className="flex items-center justify-between text-xs">
+                          <span className={ev.evidence_rows > 0 ? 'text-gray-700' : 'text-amber-700 font-medium'}>
+                            {ev.evidence_rows > 0 ? <Check size={12} className="inline mr-1 text-green-600" /> : <AlertCircle size={12} className="inline mr-1" />}
+                            {label}
+                          </span>
+                          <span className="text-gray-400">{ev.evidence_rows} record(s){ev.sheet_created ? ` · '${ev.sheet_created}' sheet` : ' · needs manual input'}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <button
+                onClick={() => agentApi.downloadRfpResult(result.form_id, `${result.client_name}_RFP.xlsx`)}
+                className="btn-primary inline-flex"
+              >
+                <Download size={16} />
+                Download {result.client_name}_RFP.xlsx
+              </button>
+            </div>
+          )}
 
           {/* For Excel mode — download */}
           {mode === 'excel' && (

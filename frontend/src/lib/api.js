@@ -142,6 +142,13 @@ export const agentApi = {
     fd.append('save_to_db', saveToDb ? 'true' : 'false')
     return api.post('/api/agent/save-learned-answer', fd)
   },
+  processRfpQuestionnaire: (clientName, file) => {
+    const fd = new FormData()
+    fd.append('client_name', clientName)
+    fd.append('file', file)
+    return api.post('/api/agent/process-rfp-questionnaire', fd, { timeout: 120000 })
+  },
+  downloadRfpResult: (formId, filename) => downloadFile(`/api/agent/rfp-download/${formId}`, filename),
 }
 
 // Forms
