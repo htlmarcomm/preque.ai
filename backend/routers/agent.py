@@ -646,6 +646,7 @@ def _large_projects(db: Session):
         # "biggest projects" and crowd out real, verifiable evidence.
         if area and 200000 <= area <= 2000000:
             rows.append({
+                "id": r.id,
                 "Project Name": d.get("project_name") or d.get("end_user") or r.primary_label,
                 "Client / End User": d.get("end_user") or d.get("client_name"),
                 "Area (Sq Ft)": area,
@@ -654,7 +655,11 @@ def _large_projects(db: Session):
             })
     rows.sort(key=lambda x: x["Area (Sq Ft)"] or 0, reverse=True)
     cols = ["Project Name", "Client / End User", "Area (Sq Ft)", "Contract Value", "Completion Date"]
-    return cols, rows[:25]
+    # Candidate list for the picker deliberately isn't capped as tightly as
+    # the old auto-fill default (25) -- the user is CHOOSING from this list
+    # now (per explicit request: prefilter, then let them pick), so more
+    # real options is better here than fewer.
+    return cols, rows[:150]
 
 
 def _lab_rnd_projects(db: Session):
@@ -666,23 +671,25 @@ def _lab_rnd_projects(db: Session):
         if not name:
             continue
         rows.append({
+            "id": r.id,
             "Project Name": name,
             "Client / End User": d.get("end_user") or d.get("client_name"),
             "Sector": d.get("job_sector"),
             "Completion Date": d.get("end_date"),
         })
     cols = ["Project Name", "Client / End User", "Sector", "Completion Date"]
-    return cols, rows[:25]
+    return cols, rows[:150]
 
 
 def _ongoing_projects(db: Session):
-    records = db.query(ProjectDataRecord).filter(ProjectDataRecord.source_file.contains("Ongoing")).limit(25).all()
+    records = db.query(ProjectDataRecord).filter(ProjectDataRecord.source_file.contains("Ongoing")).limit(150).all()
     rows = []
     for r in records:
         d = r.data or {}
         if not (d.get("project_name") or d.get("client_name")):
             continue
         rows.append({
+            "id": r.id,
             "Project Name": d.get("project_name") or d.get("client_name"),
             "Start Date": d.get("start_date"),
             "Expected Completion": d.get("end_date"),
@@ -691,11 +698,12 @@ def _ongoing_projects(db: Session):
 
 
 def _pmc_siemens_projects(db: Session):
-    records = db.query(ProjectDataRecord).filter(ProjectDataRecord.search_text.contains("siemens")).limit(25).all()
+    records = db.query(ProjectDataRecord).filter(ProjectDataRecord.search_text.contains("siemens")).limit(50).all()
     rows = []
     for r in records:
         d = r.data or {}
         rows.append({
+            "id": r.id,
             "Project Name": d.get("project_name") or d.get("client_name"),
             "Client / End User": d.get("end_user") or d.get("client_name"),
             "Location": d.get("location"),
@@ -731,8 +739,9 @@ def _client_references(db: Session):
     refs = db.query(ProjectReference).filter(
         ProjectReference.client_rep_name.isnot(None),
         ProjectReference.client_rep_phone.isnot(None),
-    ).limit(25).all()
+    ).limit(100).all()
     rows = [{
+        "id": r.id,
         "Client Name": r.client_name, "Project": r.project_name,
         "Contact Name": r.client_rep_name, "Designation": r.client_rep_designation,
         "Phone": r.client_rep_phone, "Email": r.client_rep_email,
@@ -821,6 +830,34 @@ def _build_narrative(rows: list, sheet_name: str | None) -> str:
             f"See the '{sheet_name}' sheet in this workbook for the full supporting detail.")
 
 
+_PENDING_NARRATIVE = "Awaiting evidence selection -- pick which records to feature, then this cell updates automatically."
+
+# Evidence types backed by a genuine LIST of candidate records (as opposed to
+# a fixed handful of company facts like EHS fields or financial history) --
+# per explicit request, these get a picker instead of an automatic top-N
+# pick, so the user chooses which specific projects/references to feature
+# rather than the system silently deciding for them.
+_PICKABLE_LABELS = {
+    "Large-Scale Project History", "Lab/R&D Project History", "Ongoing Projects",
+    "PMC & Siemens Client Experience", "Client References",
+}
+
+
+def _new_evidence_sheet(wb, label: str, columns: list, rows: list) -> str:
+    sheet_name = _safe_sheet_name(label)
+    base_name, n = sheet_name, 1
+    while sheet_name in wb.sheetnames:
+        n += 1
+        sheet_name = _safe_sheet_name(f"{base_name[:28]}-{n}")
+    evsheet = wb.create_sheet(sheet_name)
+    for ci, col_name in enumerate(columns, start=1):
+        evsheet.cell(row=1, column=ci, value=col_name)
+    for ri, rec in enumerate(rows, start=2):
+        for ci, col_name in enumerate(columns, start=1):
+            evsheet.cell(row=ri, column=ci, value=rec.get(col_name))
+    return sheet_name
+
+
 @router.post("/process-rfp-questionnaire")
 def process_rfp_questionnaire(
     client_name: str = Form(...),
@@ -889,47 +926,49 @@ def process_rfp_questionnaire(
     # question re-running the query and creating a duplicate.
     evidence_cache = {}
     category_summary = {}
+    pending_evidence = {}      # label -> {columns, candidates} -- awaiting user pick
+    question_labels = []       # [{row, category, label}] -- for finalizing later
+    resolved_labels = {}       # label -> {sheet_name, row_count} -- already written
+
     for q in questions:
         label, columns, rows = _gather_evidence_for_question(q["category"], q["criterion"], q["evidence_text"], db)
+        question_labels.append({"row": q["row"], "category": q["category"], "label": label})
+
+        if label in _PICKABLE_LABELS and rows:
+            # Defer: don't auto-pick which records to feature. Leave a
+            # placeholder in VENDOR RESPONSE until the user resolves this via
+            # POST /rfp-select-evidence.
+            if label not in pending_evidence:
+                pending_evidence[label] = {"columns": columns, "candidates": rows}
+            ws.cell(row=q["row"], column=col_map["response"], value=_PENDING_NARRATIVE)
+            continue
 
         if label not in evidence_cache:
-            sheet_name = None
-            if rows:
-                sheet_name = _safe_sheet_name(label)
-                base_name, n = sheet_name, 1
-                while sheet_name in wb.sheetnames:
-                    n += 1
-                    sheet_name = _safe_sheet_name(f"{base_name[:28]}-{n}")
-                evsheet = wb.create_sheet(sheet_name)
-                for ci, col_name in enumerate(columns, start=1):
-                    evsheet.cell(row=1, column=ci, value=col_name)
-                for ri, rec in enumerate(rows, start=2):
-                    for ci, col_name in enumerate(columns, start=1):
-                        evsheet.cell(row=ri, column=ci, value=rec.get(col_name))
+            sheet_name = _new_evidence_sheet(wb, label, columns, rows) if rows else None
             evidence_cache[label] = (sheet_name, rows)
-
         sheet_name, rows = evidence_cache[label]
+        if label is not None:
+            resolved_labels[label] = {"sheet_name": sheet_name, "row_count": len(rows)}
         narrative = _build_narrative(rows, sheet_name)
         ws.cell(row=q["row"], column=col_map["response"], value=narrative)
 
-        cat_entry = category_summary.setdefault(q["category"], {"questions": 0, "evidence_types": {}})
-        cat_entry["questions"] += 1
-        cat_entry["evidence_types"][label or "None"] = {"evidence_rows": len(rows), "sheet_created": sheet_name}
-
-    out_buf = io.BytesIO()
-    wb.save(out_buf)
-    out_bytes = out_buf.getvalue()
+    category_summary = _build_category_summary(question_labels, resolved_labels, pending_evidence)
 
     out_filename = f"rfp_filled_{safe_name}"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with open(os.path.join(OUTPUT_DIR, out_filename), "wb") as f:
-        f.write(out_bytes)
+    out_path = os.path.join(OUTPUT_DIR, out_filename)
+    wb.save(out_path)
 
     form = FilledForm(
         client_name=client_name,
         form_type="rfp_questionnaire",
         original_filename=safe_name,
-        filled_data={"category_summary": category_summary, "output_filename": out_filename},
+        filled_data={
+            "output_filename": out_filename,
+            "question_labels": question_labels,
+            "resolved_labels": resolved_labels,
+            "pending_evidence": pending_evidence,
+        },
         unknown_fields=[],
         doc_checklist=[],
     )
@@ -939,8 +978,112 @@ def process_rfp_questionnaire(
         "form_id": form.id,
         "client_name": client_name,
         "category_summary": category_summary,
-        "download_url": f"/api/agent/rfp-download/{form.id}",
+        "pending_evidence": {label: {"columns": v["columns"], "candidates": v["candidates"]} for label, v in pending_evidence.items()},
+        "download_url": f"/api/agent/rfp-download/{form.id}" if not pending_evidence else None,
     }
+
+
+def _build_category_summary(question_labels: list, resolved_labels: dict, pending_evidence: dict) -> dict:
+    category_summary = {}
+    for q in question_labels:
+        cat_entry = category_summary.setdefault(q["category"], {"questions": 0, "evidence_types": {}})
+        cat_entry["questions"] += 1
+        label = q["label"] or "None"
+        if label in pending_evidence:
+            cat_entry["evidence_types"][label] = {"evidence_rows": None, "sheet_created": None, "status": "awaiting_selection"}
+        else:
+            info = resolved_labels.get(label, {"sheet_name": None, "row_count": 0})
+            cat_entry["evidence_types"][label] = {"evidence_rows": info["row_count"], "sheet_created": info["sheet_name"], "status": "resolved"}
+    return category_summary
+
+
+class RfpEvidenceSelection(BaseModel):
+    selections: dict[str, list[int]]
+
+
+@router.post("/rfp-select-evidence/{form_id}")
+def select_rfp_evidence(form_id: int, req: RfpEvidenceSelection, db: Session = Depends(get_db)):
+    form = db.query(FilledForm).filter(FilledForm.id == form_id, FilledForm.form_type == "rfp_questionnaire").first()
+    if not form:
+        raise HTTPException(404, "Form not found")
+
+    fd = dict(form.filled_data or {})
+    pending_evidence = dict(fd.get("pending_evidence") or {})
+    resolved_labels = dict(fd.get("resolved_labels") or {})
+    question_labels = fd.get("question_labels") or []
+    out_filename = fd.get("output_filename")
+    if not out_filename:
+        raise HTTPException(400, "This form has no output file to update.")
+
+    out_path = os.path.join(OUTPUT_DIR, out_filename)
+    if not os.path.exists(out_path):
+        raise HTTPException(404, "Output file missing -- the form may need to be reprocessed.")
+
+    wb = openpyxl.load_workbook(out_path)
+    ws = wb.worksheets[0]
+
+    # VENDOR RESPONSE column isn't stored in filled_data -- re-derive it the
+    # same way process_rfp_questionnaire did, by re-scanning row 1-10 once.
+    response_col = None
+    for row in ws.iter_rows(min_row=1, max_row=10):
+        for cell in row:
+            if cell.value and "RESPONSE" in str(cell.value).upper():
+                response_col = cell.column
+    if not response_col:
+        raise HTTPException(500, "Could not locate the VENDOR RESPONSE column in the saved workbook.")
+
+    for label, selected_ids in req.selections.items():
+        pending = pending_evidence.get(label)
+        if not pending:
+            continue  # already resolved or unknown label -- ignore rather than error
+        selected_set = set(selected_ids)
+        columns = pending["columns"]
+        chosen_rows = [c for c in pending["candidates"] if c.get("id") in selected_set]
+        # Preserve the order the user picked in, not the candidate list order
+        order = {sid: i for i, sid in enumerate(selected_ids)}
+        chosen_rows.sort(key=lambda c: order.get(c.get("id"), 0))
+
+        sheet_name = _new_evidence_sheet(wb, label, columns, chosen_rows) if chosen_rows else None
+        resolved_labels[label] = {"sheet_name": sheet_name, "row_count": len(chosen_rows)}
+        narrative = _build_narrative(chosen_rows, sheet_name)
+
+        for q in question_labels:
+            if q["label"] == label:
+                ws.cell(row=q["row"], column=response_col, value=narrative)
+
+        del pending_evidence[label]
+
+    wb.save(out_path)
+
+    fd["pending_evidence"] = pending_evidence
+    fd["resolved_labels"] = resolved_labels
+    form.filled_data = fd
+    db.commit()
+
+    category_summary = _build_category_summary(question_labels, resolved_labels, pending_evidence)
+    return {
+        "form_id": form_id,
+        "category_summary": category_summary,
+        "pending_evidence": {label: {"columns": v["columns"], "candidates": v["candidates"]} for label, v in pending_evidence.items()},
+        "download_url": f"/api/agent/rfp-download/{form_id}" if not pending_evidence else None,
+    }
+
+
+@router.get("/rfp-preview/{form_id}")
+def preview_rfp_result(form_id: int, db: Session = Depends(get_db)):
+    from routers.project_files import read_excel_preview
+    form = db.query(FilledForm).filter(FilledForm.id == form_id, FilledForm.form_type == "rfp_questionnaire").first()
+    if not form:
+        raise HTTPException(404, "Form not found")
+    out_filename = (form.filled_data or {}).get("output_filename")
+    path = os.path.join(OUTPUT_DIR, out_filename) if out_filename else None
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Output file missing")
+    try:
+        data = read_excel_preview(path)
+        return {"form_id": form_id, "name": form.original_filename, "sheets": data}
+    except Exception as e:
+        raise HTTPException(500, f"Could not generate preview: {str(e)}")
 
 
 @router.get("/rfp-download/{form_id}")

@@ -52,6 +52,15 @@ export default function FillForm() {
   const [downloading, setDownloading] = useState(false)
   const [downloadingDocId, setDownloadingDocId] = useState(null)
 
+  // RFP Questionnaire mode's evidence picker -- kept separate from the
+  // Excel-mode pendingTables/pickerSelectedIds state above (even though
+  // they serve a similar purpose) to avoid any risk of cross-contaminating
+  // the already-working Excel-mode project-table picker.
+  const [rfpPendingEvidence, setRfpPendingEvidence] = useState({})
+  const [rfpSelections, setRfpSelections] = useState({}) // label -> Set(ids)
+  const [rfpEvidenceSearch, setRfpEvidenceSearch] = useState({}) // label -> search text
+  const [rfpSubmitting, setRfpSubmitting] = useState(false)
+
   // Downloads have to go through the authenticated axios client and get
   // saved as a blob -- a plain <a href download> can't carry the X-API-Key
   // header the backend now requires on every /api/* request.
@@ -98,7 +107,9 @@ export default function FillForm() {
     setCopiedCell(null)
     
     try {
-      const res = await formsApi.preview(result.form_id)
+      const res = mode === 'rfp'
+        ? await agentApi.previewRfp(result.form_id)
+        : await formsApi.preview(result.form_id)
       const data = res.data
       setPreview({ type: 'excel', ...data })
       const firstSheet = Object.keys(data.sheets || {})[0]
@@ -278,13 +289,20 @@ export default function FillForm() {
     setStep(1)
     try {
       if (mode === 'rfp') {
-        // Distinct output shape from the other two modes -- no per-field
-        // review or project-table picker, just a per-category evidence
-        // summary and a ready-to-download workbook -- so this jumps
-        // straight to a dedicated Output view (step 3) instead of Review.
         const res = await agentApi.processRfpQuestionnaire(clientName, file)
         setResult(res.data)
-        setStep(3)
+        const pending = res.data.pending_evidence || {}
+        if (Object.keys(pending).length > 0) {
+          // Prefiltered candidates per evidence type -- the user picks which
+          // specific ones to feature, rather than the system auto-selecting.
+          // Reuses the "Review" step slot (step 2) since Excel mode's own
+          // pendingTables state (which drives that step there) is untouched.
+          setRfpPendingEvidence(pending)
+          setRfpSelections({})
+          setStep(2)
+        } else {
+          setStep(3) // Nothing needed picking -- straight to Output
+        }
         return
       }
       const res = mode === 'excel'
@@ -919,8 +937,107 @@ export default function FillForm() {
         </div>
       )}
 
+      {/* RFP Questionnaire mode: evidence picker -- one section per pending
+          evidence type, each pre-filtered to real candidates matching that
+          requirement; the user checks which specific ones to feature rather
+          than the system auto-picking. */}
+      {mode === 'rfp' && step === 2 && (
+        <div className="space-y-6">
+          <div className="p-4 bg-blue-50 border border-blue-100 rounded-xl">
+            <p className="text-sm font-medium text-blue-900">Choose supporting evidence for each section</p>
+            <p className="text-xs text-blue-700 mt-0.5">
+              Every list below is already filtered to records matching that specific requirement. Pick the ones you want to feature, then confirm.
+            </p>
+          </div>
+
+          {Object.entries(rfpPendingEvidence).map(([label, info]) => {
+            const selected = rfpSelections[label] || new Set()
+            const search = (rfpEvidenceSearch[label] || '').toLowerCase()
+            const filtered = search
+              ? info.candidates.filter(c => info.columns.some(col => String(c[col] ?? '').toLowerCase().includes(search)))
+              : info.candidates
+
+            const toggle = (id) => {
+              setRfpSelections(prev => {
+                const next = new Set(prev[label] || [])
+                if (next.has(id)) next.delete(id)
+                else next.add(id)
+                return { ...prev, [label]: next }
+              })
+            }
+
+            return (
+              <div key={label} className="card p-5">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="font-medium text-gray-900 text-sm">{label}</h3>
+                  <span className="text-xs text-gray-400">{selected.size} of {info.candidates.length} selected</span>
+                </div>
+                <div className="relative mb-3">
+                  <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" />
+                  <input
+                    className="input w-full pl-8 py-1.5 text-xs"
+                    placeholder={`Search ${label}...`}
+                    value={rfpEvidenceSearch[label] || ''}
+                    onChange={e => setRfpEvidenceSearch(prev => ({ ...prev, [label]: e.target.value }))}
+                  />
+                </div>
+                <div className="border border-gray-200 rounded-xl overflow-auto max-h-64">
+                  <table className="w-full text-xs text-left">
+                    <thead className="bg-gray-50 border-b border-gray-200 sticky top-0">
+                      <tr>
+                        <th className="px-3 py-2 w-8"></th>
+                        {info.columns.map(col => (
+                          <th key={col} className="px-3 py-2 font-medium text-gray-500 whitespace-nowrap">{col}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {filtered.map(c => (
+                        <tr key={c.id} onClick={() => toggle(c.id)}
+                          className={`cursor-pointer hover:bg-gray-50 ${selected.has(c.id) ? 'bg-brand-50' : ''}`}>
+                          <td className="px-3 py-2">
+                            <input type="checkbox" readOnly checked={selected.has(c.id)} className="w-3.5 h-3.5" />
+                          </td>
+                          {info.columns.map(col => (
+                            <td key={col} className="px-3 py-2 whitespace-nowrap">{c[col] ?? '—'}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )
+          })}
+
+          <button
+            onClick={async () => {
+              setRfpSubmitting(true); setError(null)
+              try {
+                const selections = {}
+                for (const [label, ids] of Object.entries(rfpSelections)) {
+                  selections[label] = Array.from(ids)
+                }
+                const res = await agentApi.selectRfpEvidence(result.form_id, selections)
+                setResult(prev => ({ ...prev, category_summary: res.data.category_summary, download_url: res.data.download_url }))
+                setStep(3)
+              } catch (e) {
+                setError(e.response?.data?.detail || e.message || 'Could not save evidence selections.')
+              } finally {
+                setRfpSubmitting(false)
+              }
+            }}
+            disabled={rfpSubmitting}
+            className="btn-primary"
+          >
+            {rfpSubmitting ? <Loader2 size={16} className="animate-spin" /> : <Check size={16} />}
+            Confirm selections & generate workbook
+          </button>
+        </div>
+      )}
+
       {/* STEP 3: Review (previously step 2) */}
-      {step === (pendingTables.length > 0 ? 3 : 2) && result && (
+      {mode !== 'rfp' && step === (pendingTables.length > 0 ? 3 : 2) && result && (
         <div className="space-y-6">
           {/* Stats bar */}
           <div className="grid grid-cols-4 gap-4">
@@ -1092,13 +1209,19 @@ export default function FillForm() {
                   </div>
                 ))}
               </div>
-              <button
-                onClick={() => agentApi.downloadRfpResult(result.form_id, `${result.client_name}_RFP.xlsx`)}
-                className="btn-primary inline-flex"
-              >
-                <Download size={16} />
-                Download {result.client_name}_RFP.xlsx
-              </button>
+              <div className="flex items-center gap-3">
+                <button onClick={openPreview} className="btn-secondary inline-flex">
+                  <Eye size={16} />
+                  Preview workbook
+                </button>
+                <button
+                  onClick={() => agentApi.downloadRfpResult(result.form_id, `${result.client_name}_RFP.xlsx`)}
+                  className="btn-primary inline-flex"
+                >
+                  <Download size={16} />
+                  Download {result.client_name}_RFP.xlsx
+                </button>
+              </div>
             </div>
           )}
 

@@ -149,6 +149,8 @@ export const agentApi = {
     return api.post('/api/agent/process-rfp-questionnaire', fd, { timeout: 120000 })
   },
   downloadRfpResult: (formId, filename) => downloadFile(`/api/agent/rfp-download/${formId}`, filename),
+  selectRfpEvidence: (formId, selections) => api.post(`/api/agent/rfp-select-evidence/${formId}`, { selections }),
+  previewRfp: (formId) => api.get(`/api/agent/rfp-preview/${formId}`),
 }
 
 // Forms
