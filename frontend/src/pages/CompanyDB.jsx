@@ -1,9 +1,11 @@
 import { useState, useEffect } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Plus, Search, Edit2, Trash2, Check, X, Upload, Database, Loader2, Building2, Briefcase, FileText } from 'lucide-react'
 import { companyApi, projectDataApi } from '../lib/api'
 
 export default function CompanyDB() {
-  const [activeTab, setActiveTab] = useState('Fields') // 'Fields' | 'Financials' | 'Project References'
+  const [searchParams] = useSearchParams()
+  const [activeTab, setActiveTab] = useState(searchParams.get('tab') || 'Fields') // 'Fields' | 'Financials' | 'Project References' | 'Project Details'
   
   // Fields state
   const [fields, setFields] = useState([])
@@ -18,6 +20,17 @@ export default function CompanyDB() {
   const [projects, setProjects] = useState([])
   const [projRegionFilter, setProjRegionFilter] = useState('')
   const [projStatusFilter, setProjStatusFilter] = useState('')
+  const [projPmcFilter, setProjPmcFilter] = useState('')
+  const [projThirdPartyFilter, setProjThirdPartyFilter] = useState('')
+  const [projSectorFilter, setProjSectorFilter] = useState('')
+  const [projMinValue, setProjMinValue] = useState('')
+  const [projMaxValue, setProjMaxValue] = useState('')
+  const [projMinArea, setProjMinArea] = useState('')
+  const [projMaxArea, setProjMaxArea] = useState('')
+  const [projFilterOptions, setProjFilterOptions] = useState({ regions: [], statuses: [], pmcs: [], third_parties: [], sectors: [] })
+  const [projTotal, setProjTotal] = useState(0)
+  const [projPage, setProjPage] = useState(1)
+  const [projLoadingRecords, setProjLoadingRecords] = useState(false)
 
   // Project Details state
   const [pdFiles, setPdFiles] = useState([])
@@ -53,9 +66,31 @@ export default function CompanyDB() {
     setFinancials(res.data || [])
   }
 
-  const loadProjects = async () => {
-    const res = await companyApi.getProjectReferences()
-    setProjects(res.data || [])
+  const loadProjectReferences = async () => {
+    setProjLoadingRecords(true)
+    try {
+      const params = { page: projPage, page_size: 50 }
+      if (search) params.search = search
+      if (projRegionFilter) params.region = projRegionFilter
+      if (projStatusFilter) params.status = projStatusFilter
+      if (projPmcFilter) params.pmc = projPmcFilter
+      if (projThirdPartyFilter) params.third_party = projThirdPartyFilter
+      if (projSectorFilter) params.sector = projSectorFilter
+      if (projMinValue) params.min_value = projMinValue
+      if (projMaxValue) params.max_value = projMaxValue
+      if (projMinArea) params.min_area = projMinArea
+      if (projMaxArea) params.max_area = projMaxArea
+      const res = await companyApi.getProjectReferences(params)
+      setProjects(res.data.items || [])
+      setProjTotal(res.data.total || 0)
+    } finally {
+      setProjLoadingRecords(false)
+    }
+  }
+
+  const loadProjectFilterOptions = async () => {
+    const res = await companyApi.getProjectReferenceFilterOptions()
+    setProjFilterOptions(res.data)
   }
 
   const loadFiles = async () => {
@@ -112,6 +147,21 @@ export default function CompanyDB() {
     }
   }, [pdActiveFile, pdActiveSheet, pdPage, pdSearch, pdActiveFilterValues])
 
+  useEffect(() => {
+    if (activeTab === 'Project References') {
+      loadProjectFilterOptions()
+    }
+  }, [activeTab])
+
+  useEffect(() => {
+    if (activeTab === 'Project References') {
+      const timeoutId = setTimeout(() => {
+        loadProjectReferences()
+      }, 400)
+      return () => clearTimeout(timeoutId)
+    }
+  }, [activeTab, projPage, search, projRegionFilter, projStatusFilter, projPmcFilter, projThirdPartyFilter, projSectorFilter, projMinValue, projMaxValue, projMinArea, projMaxArea])
+
   const handlePdImport = async (e) => {
     const file = e.target.files[0]
     if (!file) return
@@ -158,13 +208,13 @@ export default function CompanyDB() {
     setLoading(true)
     if (activeTab === 'Fields') await loadFields()
     if (activeTab === 'Financials') await loadFinancials()
-    if (activeTab === 'Project References') await loadProjects()
     setLoading(false)
   }
 
   // eslint-disable-next-line
   useEffect(() => { loadAll() }, [activeTab, activeCategory])
-  // We don't reload on finYearFilter or projRegionFilter because we filter locally for instant UI
+  // We don't reload on finYearFilter because we filter locally for instant UI.
+  // Project References is server-paginated/filtered instead -- see the dedicated effects above.
 
   const seed = async () => {
     setSeeding(true)
@@ -219,13 +269,19 @@ export default function CompanyDB() {
   const handleImportProjects = async (e) => {
     const file = e.target.files[0]
     if (!file) return
+    if (!confirm('This adds every row from the file as new project references — it does not update or replace existing ones, so re-uploading the same file will create duplicates. Continue?')) {
+      e.target.value = ''
+      return
+    }
     setImporting(true)
     try {
-      const res = await companyApi.importProjectsExcel(file)
-      alert(`Success! Imported ${res.data.imported} project references.`)
-      await loadAll()
+      const res = await companyApi.bulkImportProjectReferences(file)
+      alert(`Success! Imported ${res.data.imported} project references (${res.data.skipped_blank_rows} blank rows skipped).`)
+      setProjPage(1)
+      await loadProjectReferences()
+      await loadProjectFilterOptions()
     } catch (err) {
-      alert('Error importing file: ' + err.message)
+      alert('Error importing file: ' + (err.response?.data?.detail || err.message))
     } finally {
       setImporting(false)
       e.target.value = ''
@@ -259,22 +315,6 @@ export default function CompanyDB() {
     acc[yr].push(f)
     return acc
   }, {})
-
-  // Projects
-  const distinctRegions = [...new Set(projects.map(p => p.region).filter(Boolean))].sort()
-  const distinctStatuses = [...new Set(projects.map(p => p.status).filter(Boolean))].sort()
-  const filteredProjects = projects.filter(p => {
-    if (projRegionFilter && p.region !== projRegionFilter) return false
-    if (projStatusFilter && p.status !== projStatusFilter) return false
-    if (search && 
-      !p.project_name?.toLowerCase().includes(search.toLowerCase()) &&
-      !p.client_name?.toLowerCase().includes(search.toLowerCase()) &&
-      !p.location?.toLowerCase().includes(search.toLowerCase()) &&
-      !p.consultant?.toLowerCase().includes(search.toLowerCase()) &&
-      !p.pmc?.toLowerCase().includes(search.toLowerCase())
-    ) return false
-    return true
-  })
 
   return (
     <div className="p-8 max-w-7xl mx-auto h-[100vh] flex flex-col overflow-hidden">
@@ -342,11 +382,11 @@ export default function CompanyDB() {
 
       <div className="flex-1 overflow-auto min-h-0 pb-12 pr-2">
         {/* Filters Area */}
-        <div className="flex gap-3 mb-6 shrink-0">
+        <div className="flex gap-3 mb-6 shrink-0 flex-wrap">
         <div className="relative flex-1 max-w-xs">
           <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
           <input className="input w-full pl-9 text-sm" placeholder={`Search ${activeTab.toLowerCase()}…`}
-            value={search} onChange={e => setSearch(e.target.value)} />
+            value={search} onChange={e => { setSearch(e.target.value); if (activeTab === 'Project References') setProjPage(1) }} />
         </div>
         
         {/* Fields Filters */}
@@ -381,17 +421,54 @@ export default function CompanyDB() {
           <>
             <div className="flex gap-2 items-center">
               <span className="text-sm text-gray-500 font-medium">Region:</span>
-              <select className="input text-sm py-1.5" value={projRegionFilter} onChange={e => setProjRegionFilter(e.target.value)}>
+              <select className="input text-sm py-1.5" value={projRegionFilter} onChange={e => { setProjRegionFilter(e.target.value); setProjPage(1) }}>
                 <option value="">All Regions</option>
-                {distinctRegions.map(r => <option key={r} value={r}>{r}</option>)}
+                {projFilterOptions.regions.map(r => <option key={r} value={r}>{r}</option>)}
               </select>
             </div>
             <div className="flex gap-2 items-center">
               <span className="text-sm text-gray-500 font-medium">Status:</span>
-              <select className="input text-sm py-1.5" value={projStatusFilter} onChange={e => setProjStatusFilter(e.target.value)}>
+              <select className="input text-sm py-1.5" value={projStatusFilter} onChange={e => { setProjStatusFilter(e.target.value); setProjPage(1) }}>
                 <option value="">All Statuses</option>
-                {distinctStatuses.map(s => <option key={s} value={s}>{s}</option>)}
+                {projFilterOptions.statuses.map(s => <option key={s} value={s}>{s}</option>)}
               </select>
+            </div>
+            <div className="flex gap-2 items-center">
+              <span className="text-sm text-gray-500 font-medium">Sector:</span>
+              <select className="input text-sm py-1.5" value={projSectorFilter} onChange={e => { setProjSectorFilter(e.target.value); setProjPage(1) }}>
+                <option value="">All Sectors</option>
+                {projFilterOptions.sectors.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+            <div className="flex gap-2 items-center">
+              <span className="text-sm text-gray-500 font-medium">PMC:</span>
+              <select className="input text-sm py-1.5" value={projPmcFilter} onChange={e => { setProjPmcFilter(e.target.value); setProjPage(1) }}>
+                <option value="">All PMCs</option>
+                {projFilterOptions.pmcs.map(p => <option key={p} value={p}>{p}</option>)}
+              </select>
+            </div>
+            <div className="flex gap-2 items-center">
+              <span className="text-sm text-gray-500 font-medium">Third Party:</span>
+              <select className="input text-sm py-1.5" value={projThirdPartyFilter} onChange={e => { setProjThirdPartyFilter(e.target.value); setProjPage(1) }}>
+                <option value="">All Third Parties</option>
+                {projFilterOptions.third_parties.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </div>
+            <div className="flex gap-2 items-center">
+              <span className="text-sm text-gray-500 font-medium">Value (₹Cr):</span>
+              <input type="number" className="input text-sm py-1.5 w-24" placeholder="Min"
+                value={projMinValue} onChange={e => { setProjMinValue(e.target.value); setProjPage(1) }} />
+              <span className="text-gray-300">–</span>
+              <input type="number" className="input text-sm py-1.5 w-24" placeholder="Max"
+                value={projMaxValue} onChange={e => { setProjMaxValue(e.target.value); setProjPage(1) }} />
+            </div>
+            <div className="flex gap-2 items-center">
+              <span className="text-sm text-gray-500 font-medium">Area (sq.ft):</span>
+              <input type="number" className="input text-sm py-1.5 w-28" placeholder="Min"
+                value={projMinArea} onChange={e => { setProjMinArea(e.target.value); setProjPage(1) }} />
+              <span className="text-gray-300">–</span>
+              <input type="number" className="input text-sm py-1.5 w-28" placeholder="Max"
+                value={projMaxArea} onChange={e => { setProjMaxArea(e.target.value); setProjPage(1) }} />
             </div>
           </>
         )}
@@ -567,78 +644,107 @@ export default function CompanyDB() {
 
       {/* PROJECTS TAB */}
       {!loading && activeTab === 'Project References' && (
-        projects.length === 0 ? (
+        projects.length === 0 && !projLoadingRecords ? (
           <div className="card p-16 text-center">
             <Briefcase size={40} className="text-gray-200 mx-auto mb-4" />
-            <p className="font-medium text-gray-700">No project references</p>
-            <p className="text-sm text-gray-400 mt-1">Run the project reference import script to populate this table</p>
+            <p className="font-medium text-gray-700">No project references{search || projRegionFilter || projStatusFilter || projPmcFilter || projThirdPartyFilter || projSectorFilter || projMinValue || projMaxValue || projMinArea || projMaxArea ? ' match these filters' : ''}</p>
+            <p className="text-sm text-gray-400 mt-1">Use "Import Excel" above to load the unified project registry</p>
           </div>
         ) : (
-          <div className="card overflow-x-auto">
-            <table className="w-full text-sm text-left">
-              <thead className="bg-gray-50 border-b border-gray-100 text-xs text-gray-500 uppercase tracking-wider">
-                <tr>
-                  <th className="px-4 py-3 font-medium">Project Name</th>
-                  <th className="px-4 py-3 font-medium">Client</th>
-                  <th className="px-4 py-3 font-medium">Location</th>
-                  <th className="px-4 py-3 font-medium">Consultant</th>
-                  <th className="px-4 py-3 font-medium">PMC</th>
-                  <th className="px-4 py-3 font-medium">Sector</th>
-                  <th className="px-4 py-3 font-medium">Type</th>
-                  <th className="px-4 py-3 font-medium">Value</th>
-                  <th className="px-4 py-3 font-medium">Status</th>
-                  <th className="px-4 py-3 font-medium">Timeline</th>
-                  <th className="px-4 py-3 font-medium">Rep Contact</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-100">
-                {filteredProjects.map(p => (
-                  <tr key={p.id} className="hover:bg-gray-50">
-                    <td className="px-4 py-3 font-medium text-gray-900 max-w-[250px] truncate" title={p.project_name}>
-                      {p.project_name}
-                      <div className="text-[10px] text-gray-400 font-normal mt-0.5">{p.region}</div>
-                    </td>
-                    <td className="px-4 py-3 text-gray-700 max-w-[150px] truncate" title={p.client_name}>{p.client_name}</td>
-                    <td className="px-4 py-3 text-gray-500">{p.location || '-'}</td>
-                    <td className="px-4 py-3 text-gray-500">{p.consultant || '-'}</td>
-                    <td className="px-4 py-3 text-gray-500">{p.pmc || '-'}</td>
-                    <td className="px-4 py-3 text-gray-500">{p.project_sector || '-'}</td>
-                    <td className="px-4 py-3 text-gray-500 max-w-[150px] truncate" title={p.project_type}>{p.project_type || '-'}</td>
-                    <td className="px-4 py-3 text-gray-900">{p.project_value || '-'}</td>
-                    <td className="px-4 py-3">
-                      {p.status && (
-                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-medium ${
-                          p.status.toLowerCase().includes('completed') ? 'bg-green-100 text-green-700' :
-                          p.status.toLowerCase().includes('ongoing') ? 'bg-blue-100 text-blue-700' :
-                          'bg-gray-100 text-gray-700'
-                        }`}>
-                          {p.status}
-                        </span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap text-xs">
-                      {p.start_date || p.end_date ? (
-                        <>
-                          <div>{p.start_date || '-'}</div>
-                          <div className="text-gray-400">to {p.end_date || '-'}</div>
-                        </>
-                      ) : '-'}
-                    </td>
-                    <td className="px-4 py-3 text-xs">
-                      {p.client_rep_name ? (
-                        <div>
-                          <div className="font-medium text-gray-900">{p.client_rep_name}</div>
-                          {p.client_rep_designation && <div className="text-gray-500">{p.client_rep_designation}</div>}
-                          {p.client_rep_phone && <div className="text-brand-600 mt-0.5">{p.client_rep_phone}</div>}
-                          {p.client_rep_email && <div className="text-brand-600 truncate max-w-[150px]" title={p.client_rep_email}>{p.client_rep_email}</div>}
-                        </div>
-                      ) : <span className="text-gray-400 italic">No contact</span>}
-                    </td>
+          <>
+            <div className="card overflow-x-auto min-h-[300px] relative">
+              {projLoadingRecords && (
+                <div className="absolute inset-0 bg-white/50 flex items-center justify-center z-10">
+                  <Loader2 size={30} className="animate-spin text-brand-500" />
+                </div>
+              )}
+              <table className="w-full text-sm text-left">
+                <thead className="bg-gray-50 border-b border-gray-100 text-xs text-gray-500 uppercase tracking-wider">
+                  <tr>
+                    <th className="px-4 py-3 font-medium">Project Name</th>
+                    <th className="px-4 py-3 font-medium">Client</th>
+                    <th className="px-4 py-3 font-medium">Location</th>
+                    <th className="px-4 py-3 font-medium">Consultant</th>
+                    <th className="px-4 py-3 font-medium">PMC</th>
+                    <th className="px-4 py-3 font-medium">Third Party</th>
+                    <th className="px-4 py-3 font-medium">Sector</th>
+                    <th className="px-4 py-3 font-medium">Type</th>
+                    <th className="px-4 py-3 font-medium">Area</th>
+                    <th className="px-4 py-3 font-medium">Value</th>
+                    <th className="px-4 py-3 font-medium">Status</th>
+                    <th className="px-4 py-3 font-medium">Timeline</th>
+                    <th className="px-4 py-3 font-medium">Rep Contact</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {projects.map(p => (
+                    <tr key={p.id} className="hover:bg-gray-50">
+                      <td className="px-4 py-3 font-medium text-gray-900 max-w-[250px] truncate" title={p.project_name || p.client_name}>
+                        {p.project_name || <span className="text-gray-400 italic">{p.client_name || '(unnamed)'}</span>}
+                        <div className="text-[10px] text-gray-400 font-normal mt-0.5">{p.region}</div>
+                      </td>
+                      <td className="px-4 py-3 text-gray-700 max-w-[150px] truncate" title={p.client_name}>{p.client_name || '-'}</td>
+                      <td className="px-4 py-3 text-gray-500">{p.location || '-'}</td>
+                      <td className="px-4 py-3 text-gray-500">{p.consultant || '-'}</td>
+                      <td className="px-4 py-3 text-gray-500">{p.pmc || '-'}</td>
+                      <td className="px-4 py-3 text-gray-500">{p.third_party || '-'}</td>
+                      <td className="px-4 py-3 text-gray-500">{p.project_sector || '-'}</td>
+                      <td className="px-4 py-3 text-gray-500 max-w-[150px] truncate" title={p.project_type}>{p.project_type || '-'}</td>
+                      <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{p.area_sqft || '-'}</td>
+                      <td className="px-4 py-3 text-gray-900 whitespace-nowrap">{p.project_value || '-'}</td>
+                      <td className="px-4 py-3">
+                        {p.status && (
+                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-medium ${
+                            p.status.toLowerCase().includes('completed') ? 'bg-green-100 text-green-700' :
+                            p.status.toLowerCase().includes('ongoing') ? 'bg-blue-100 text-blue-700' :
+                            'bg-gray-100 text-gray-700'
+                          }`}>
+                            {p.status}
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-gray-500 whitespace-nowrap text-xs">
+                        {p.start_date || p.end_date ? (
+                          <>
+                            <div>{p.start_date || '-'}</div>
+                            <div className="text-gray-400">to {p.end_date || '-'}</div>
+                          </>
+                        ) : '-'}
+                      </td>
+                      <td className="px-4 py-3 text-xs">
+                        {p.client_rep_name ? (
+                          <div>
+                            <div className="font-medium text-gray-900">{p.client_rep_name}</div>
+                            {p.client_rep_designation && <div className="text-gray-500">{p.client_rep_designation}</div>}
+                            {p.client_rep_phone && <div className="text-brand-600 mt-0.5">{p.client_rep_phone}</div>}
+                            {p.client_rep_email && <div className="text-brand-600 truncate max-w-[150px]" title={p.client_rep_email}>{p.client_rep_email}</div>}
+                          </div>
+                        ) : <span className="text-gray-400 italic">No contact</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {projTotal > 0 && (
+              <div className="flex items-center justify-between text-sm text-gray-500 px-2 mt-3">
+                <div>{projTotal.toLocaleString()} project{projTotal === 1 ? '' : 's'} — page {projPage} of {Math.ceil(projTotal / 50)}</div>
+                <div className="flex gap-2">
+                  <button
+                    disabled={projPage <= 1}
+                    onClick={() => setProjPage(p => p - 1)}
+                    className="px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50 disabled:opacity-50"
+                  >Previous</button>
+                  <button
+                    disabled={projPage >= Math.ceil(projTotal / 50)}
+                    onClick={() => setProjPage(p => p + 1)}
+                    className="px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50 disabled:opacity-50"
+                  >Next</button>
+                </div>
+              </div>
+            )}
+          </>
         )
       )}
       {/* PROJECT DETAILS TAB */}

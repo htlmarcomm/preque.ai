@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer, JSON, Boolean
+from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer, JSON, Boolean, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
@@ -127,6 +127,10 @@ class ProjectReference(Base):
     project_sector = Column(String(100))
     project_type = Column(Text)
     project_value = Column(String(50))
+    area_sqft_numeric = Column(Float, nullable=True)        # parsed numeric sqft, for range filtering (area_sqft above stays the display string)
+    project_value_cr = Column(Float, nullable=True)         # parsed numeric value in Rs Cr, for range filtering (project_value above stays the display string)
+    third_party = Column(String(200), nullable=True)        # distinct from `pmc` -- source data sometimes carries both, with different values
+    notes = Column(Text, nullable=True)                     # full free-text notes preserved verbatim (bulk import), for anything not captured by a dedicated column
     status = Column(String(50))                            # "Completed" | "Ongoing"
     start_date = Column(String(50))
     end_date = Column(String(50))

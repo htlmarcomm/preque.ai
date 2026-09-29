@@ -96,8 +96,13 @@ export const companyApi = {
     const fd = new FormData(); fd.append('file', file)
     return api.post('/api/company/import-projects', fd)
   },
+  bulkImportProjectReferences: (file) => {
+    const fd = new FormData(); fd.append('file', file)
+    return api.post('/api/company/project-references/bulk-import', fd)
+  },
   getFinancialRecords: (category, year) => api.get('/api/company/financial-records', { params: { category, year } }),
-  getProjectReferences: (region, status, client) => api.get('/api/company/project-references', { params: { region, status, client } }),
+  getProjectReferences: (params) => api.get('/api/company/project-references', { params }),
+  getProjectReferenceFilterOptions: () => api.get('/api/company/project-references/filter-options'),
   searchCompanyData: (q, type, category, year) => api.get('/api/company/search', { params: { q, type, category, year } }),
 }
 

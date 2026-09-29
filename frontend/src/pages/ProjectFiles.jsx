@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
-import { Search, Upload, Link, X, Eye, Download, Trash2, ChevronDown, ChevronRight, Tag, Building2, FileSpreadsheet, Plus, Copy, Check, FileText, Loader2 } from 'lucide-react'
+import { Link as RouterLink } from 'react-router-dom'
+import { Search, Upload, Link, X, Eye, Download, Trash2, ChevronDown, ChevronRight, Tag, Building2, FileSpreadsheet, Plus, Copy, Check, FileText, Loader2, ArrowRight } from 'lucide-react'
 import { projectFilesApi } from '../lib/api'
 
 const CATEGORY_COLORS = {
@@ -219,6 +220,24 @@ export default function ProjectFiles() {
             {categories.map(c => <option key={c} value={c}>{c}</option>)}
           </select>
         </div>
+
+        {/* Cross-link to the searchable, filterable project table */}
+        {filterCat === 'Project Registry' && (
+          <RouterLink
+            to="/company?tab=Project References"
+            style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
+              padding: '12px 16px', marginBottom: 16, borderRadius: 10,
+              background: '#fffbeb', border: '1.5px solid #fde68a', color: '#92400e',
+              fontSize: 13, fontWeight: 500, textDecoration: 'none',
+            }}
+          >
+            <span>Digging through these files to find one project? Search and filter every project (by price, area, PMC/third party, and more) in one table instead.</span>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 4, whiteSpace: 'nowrap', fontWeight: 700 }}>
+              Open Project References <ArrowRight size={14} />
+            </span>
+          </RouterLink>
+        )}
 
         {/* File Groups */}
         {loading ? (
@@ -459,37 +478,160 @@ function FileRow({ file, onPreview, onDelete, onDownload, downloadingId, categor
 }
 
 /* ── Upload Form ── */
+// FIX: backend's POST /upload takes exactly one file per call (and a
+// required `name`), so multi-file support is done here on the frontend.
+// Two-step flow, per explicit request: (1) pick however many files first,
+// with no metadata fields shown yet, (2) THEN one card appears per file so
+// each can get its own Name/Client/Category/Tags/Notes before uploading --
+// not a single shared set of fields applied to every file.
 function UploadForm({ categories, onDone, onCancel }) {
-  const [form, setForm] = useState({ name: '', client: '', category: 'Company General Data', tags: '', notes: '' })
-  const [file, setFile] = useState(null)
+  const [files, setFiles] = useState([])          // raw File objects
+  const [meta, setMeta] = useState([])             // per-file {name, client, category, tags, notes}
   const [loading, setLoading] = useState(false)
+  const [progress, setProgress] = useState(null)   // { done, total, current }
+  const [failures, setFailures] = useState([])
+
+  function pickFiles(fileList) {
+    const picked = [...fileList]
+    setFiles(picked)
+    setMeta(picked.map(f => ({
+      name: f.name.replace(/\.[^/.]+$/, ''),
+      client: '', category: 'Company General Data', tags: '', notes: '',
+    })))
+    setFailures([])
+  }
+
+  function updateMeta(idx, patch) {
+    setMeta(prev => prev.map((m, i) => i === idx ? { ...m, ...patch } : m))
+  }
+
+  function removeFile(idx) {
+    setFiles(prev => prev.filter((_, i) => i !== idx))
+    setMeta(prev => prev.filter((_, i) => i !== idx))
+  }
+
+  function startOver() {
+    setFiles([]); setMeta([]); setFailures([])
+  }
 
   async function submit() {
-    if (!form.name) return alert('Name is required')
+    if (files.length === 0) return
+    const missingName = meta.findIndex(m => !m.name.trim())
+    if (missingName !== -1) return alert(`"${files[missingName].name}" needs a name before uploading.`)
+
     setLoading(true)
-    const fd = new FormData()
-    Object.entries(form).forEach(([k, v]) => fd.append(k, v))
-    if (file) fd.append('file', file)
-    await projectFilesApi.upload(fd)
+    setFailures([])
+    const failed = []
+
+    for (let i = 0; i < files.length; i++) {
+      setProgress({ done: i, total: files.length, current: files[i].name })
+      const m = meta[i]
+      const fd = new FormData()
+      fd.append('name', m.name)
+      fd.append('client', m.client)
+      fd.append('category', m.category)
+      fd.append('tags', m.tags)
+      fd.append('notes', m.notes)
+      fd.append('file', files[i])
+      try {
+        await projectFilesApi.upload(fd)
+      } catch (e) {
+        failed.push({ idx: i, name: files[i].name, error: e.response?.data?.detail || e.message || 'Upload failed' })
+      }
+    }
+
+    setProgress(null)
     setLoading(false)
+
+    if (failed.length > 0) {
+      setFailures(failed)
+      return // Let the user see which ones failed instead of silently closing
+    }
     onDone()
   }
 
+  // Step 1: nothing chosen yet -- just the file picker, no metadata fields.
+  if (files.length === 0) {
+    return (
+      <div style={{ background: '#fff', border: '1.5px solid #e2e8f0', borderRadius: 10, padding: 20, marginBottom: 20 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
+          <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: '#0f172a' }}>Upload Files</h3>
+          <button onClick={onCancel} style={{ background: 'none', border: 'none', cursor: 'pointer' }}><X size={16} color="#64748b" /></button>
+        </div>
+        <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 12px' }}>
+          Choose one or more files. You'll set the name, category, and other details for each one next.
+        </p>
+        <input type="file" multiple onChange={e => pickFiles(e.target.files)} style={{ fontSize: 13 }} />
+      </div>
+    )
+  }
+
+  // Step 2: one editable card per file.
   return (
-    <FormPanel title="Upload File" onCancel={onCancel} onSubmit={submit} loading={loading} submitLabel="Upload">
-      <FormRow label="Name *"><input value={form.name} onChange={e => setForm(p => ({ ...p, name: e.target.value }))} placeholder="e.g. Hinduja House PQ Form" style={inp} /></FormRow>
-      <FormRow label="Client"><input value={form.client} onChange={e => setForm(p => ({ ...p, client: e.target.value }))} placeholder="e.g. JLL India" style={inp} /></FormRow>
-      <FormRow label="Category">
-        <select value={form.category} onChange={e => setForm(p => ({ ...p, category: e.target.value }))} style={inp}>
-          {categories.map(c => <option key={c}>{c}</option>)}
-        </select>
-      </FormRow>
-      <FormRow label="Tags"><input value={form.tags} onChange={e => setForm(p => ({ ...p, tags: e.target.value }))} placeholder="comma-separated e.g. HTL, 2024, Mumbai" style={inp} /></FormRow>
-      <FormRow label="Notes"><input value={form.notes} onChange={e => setForm(p => ({ ...p, notes: e.target.value }))} placeholder="Optional notes" style={inp} /></FormRow>
-      <FormRow label="File">
-        <input type="file" onChange={e => setFile(e.target.files[0])} style={{ fontSize: 13 }} />
-      </FormRow>
-    </FormPanel>
+    <div style={{ background: '#fff', border: '1.5px solid #e2e8f0', borderRadius: 10, padding: 20, marginBottom: 20 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+        <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: '#0f172a' }}>
+          {files.length} file{files.length !== 1 ? 's' : ''} selected — set details for each
+        </h3>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+          <button onClick={startOver} disabled={loading} style={{ background: 'none', border: 'none', color: '#64748b', fontSize: 12, cursor: 'pointer' }}>Choose different files</button>
+          <button onClick={onCancel} style={{ background: 'none', border: 'none', cursor: 'pointer' }}><X size={16} color="#64748b" /></button>
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, maxHeight: 420, overflowY: 'auto', marginBottom: 16 }}>
+        {files.map((f, i) => {
+          const fail = failures.find(x => x.idx === i)
+          return (
+            <div key={i} style={{ border: fail ? '1.5px solid #fca5a5' : '1.5px solid #e2e8f0', borderRadius: 8, padding: 12, background: fail ? '#fef2f2' : '#f8fafc' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#374151', fontWeight: 600, overflow: 'hidden' }}>
+                  <FileSpreadsheet size={13} color="#10b981" style={{ flexShrink: 0 }} />
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                  <span style={{ color: '#94a3b8', fontWeight: 400, flexShrink: 0 }}>({(f.size / 1024).toFixed(0)} KB)</span>
+                </span>
+                <button onClick={() => removeFile(i)} disabled={loading} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0, flexShrink: 0 }}>
+                  <X size={14} color="#94a3b8" />
+                </button>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                <FormRow label="Name *"><input value={meta[i].name} onChange={e => updateMeta(i, { name: e.target.value })} style={inp} /></FormRow>
+                <FormRow label="Client"><input value={meta[i].client} onChange={e => updateMeta(i, { client: e.target.value })} placeholder="e.g. JLL India" style={inp} /></FormRow>
+                <FormRow label="Category">
+                  <select value={meta[i].category} onChange={e => updateMeta(i, { category: e.target.value })} style={inp}>
+                    {categories.map(c => <option key={c}>{c}</option>)}
+                  </select>
+                </FormRow>
+                <FormRow label="Tags"><input value={meta[i].tags} onChange={e => updateMeta(i, { tags: e.target.value })} placeholder="comma-separated" style={inp} /></FormRow>
+                <div style={{ gridColumn: '1 / -1' }}>
+                  <FormRow label="Notes"><input value={meta[i].notes} onChange={e => updateMeta(i, { notes: e.target.value })} placeholder="Optional notes" style={inp} /></FormRow>
+                </div>
+              </div>
+              {fail && <p style={{ fontSize: 11, color: '#b91c1c', margin: '8px 0 0' }}>Failed: {fail.error}</p>}
+            </div>
+          )
+        })}
+      </div>
+
+      {progress && (
+        <div style={{ fontSize: 12, color: '#64748b', marginBottom: 10 }}>
+          Uploading {progress.done + 1} of {progress.total}: {progress.current}
+        </div>
+      )}
+      {failures.length > 0 && !progress && (
+        <p style={{ fontSize: 12, color: '#991b1b', marginBottom: 10 }}>
+          {failures.length} of {files.length} failed (marked above) — the rest uploaded successfully. Fix and retry, or close this and check File Cabinet.
+        </p>
+      )}
+
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+        <button onClick={onCancel} style={{ padding: '8px 16px', background: '#f1f5f9', border: 'none', borderRadius: 8, fontSize: 13, cursor: 'pointer', color: '#374151' }}>Cancel</button>
+        <button onClick={submit} disabled={loading}
+          style={{ padding: '8px 16px', background: '#dc2626', color: '#fff', border: 'none', borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: 'pointer', opacity: loading ? 0.7 : 1 }}>
+          {loading ? 'Uploading…' : `Upload ${files.length} file${files.length !== 1 ? 's' : ''}`}
+        </button>
+      </div>
+    </div>
   )
 }
 

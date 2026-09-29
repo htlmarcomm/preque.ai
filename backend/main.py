@@ -14,6 +14,28 @@ from auth import require_user, client_ip, hash_password
 
 Base.metadata.create_all(bind=engine)
 
+# Additive schema patch: create_all() above creates missing TABLES but does not
+# add new COLUMNS to a table that already exists (e.g. project_references on
+# any install from before the price/area/third-party filter work). Each ALTER
+# is tried independently and a "duplicate column" failure is silently ignored,
+# so this is idempotent and safe to run on every startup.
+def _migrate_project_reference_columns():
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        for ddl in [
+            "ALTER TABLE project_references ADD COLUMN area_sqft_numeric FLOAT",
+            "ALTER TABLE project_references ADD COLUMN project_value_cr FLOAT",
+            "ALTER TABLE project_references ADD COLUMN third_party VARCHAR(200)",
+            "ALTER TABLE project_references ADD COLUMN notes TEXT",
+        ]:
+            try:
+                conn.execute(text(ddl))
+                conn.commit()
+            except Exception:
+                pass  # column already exists
+
+_migrate_project_reference_columns()
+
 # First-boot admin seeding: if no users exist yet, create one from
 # INITIAL_ADMIN_USERNAME/INITIAL_ADMIN_PASSWORD env vars so there's a way to
 # log in at all on a fresh deploy. Only runs when the users table is empty --
