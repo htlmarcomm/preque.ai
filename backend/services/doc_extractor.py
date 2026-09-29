@@ -58,7 +58,16 @@ def _extract_pdf_vision(filepath: str) -> List[Dict[str, str]]:
     os.close(tmp_fd)
     try:
         shutil.copy(filepath, tmp_path)
-        pages = convert_from_path(tmp_path, dpi=150)
+        # FIX (P0 -- a single malformed PDF could hang the entire backend):
+        # poppler's pdftoppm, which this shells out to, doesn't reliably
+        # error out on garbage/corrupt PDF input -- it can hang
+        # indefinitely instead. Reproduced directly with a plain text file
+        # saved as .pdf: the whole server stopped responding to ANY request
+        # (including /api/health) until the process was killed by hand.
+        # timeout kills the subprocess after 60s so one bad file degrades
+        # to "this file's search text didn't extract" instead of "the app
+        # is down for everyone."
+        pages = convert_from_path(tmp_path, dpi=150, timeout=60)
         
         for i, page in enumerate(pages):
             img_byte_arr = io.BytesIO()

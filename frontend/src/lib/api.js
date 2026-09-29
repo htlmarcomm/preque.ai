@@ -72,6 +72,20 @@ export async function downloadFile(url, filename) {
   window.URL.revokeObjectURL(blobUrl)
 }
 
+// Same as downloadFile, but for endpoints that need a POST body (e.g.
+// exporting a specific set of selected record IDs) rather than a plain GET.
+async function downloadFile2Post(url, body, filename) {
+  const res = await api.post(url, body, { responseType: 'blob' })
+  const blobUrl = window.URL.createObjectURL(res.data)
+  const a = document.createElement('a')
+  a.href = blobUrl
+  a.download = filename || ''
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  window.URL.revokeObjectURL(blobUrl)
+}
+
 // Fetches an authenticated GET endpoint as a blob object URL, for inline
 // <img>/<iframe> previews. Caller owns the returned URL and must
 // window.URL.revokeObjectURL(...) it once no longer displayed.
@@ -103,6 +117,7 @@ export const companyApi = {
   getFinancialRecords: (category, year) => api.get('/api/company/financial-records', { params: { category, year } }),
   getProjectReferences: (params) => api.get('/api/company/project-references', { params }),
   getProjectReferenceFilterOptions: () => api.get('/api/company/project-references/filter-options'),
+  exportProjectReferences: (ids) => downloadFile2Post('/api/company/project-references/export', { ids }, 'client_references.xlsx'),
   searchCompanyData: (q, type, category, year) => api.get('/api/company/search', { params: { q, type, category, year } }),
 }
 
@@ -182,6 +197,14 @@ export const projectFilesApi = {
   download: (id, filename) => downloadFile(`/api/project-files/${id}/download`, filename),
   upload: (formData) => api.post('/api/project-files/upload', formData),
   addSharepoint: (formData) => api.post('/api/project-files/add-sharepoint', formData),
+  attachFile: (id, file) => {
+    const fd = new FormData(); fd.append('file', file)
+    return api.post(`/api/project-files/${id}/attach-file`, fd)
+  },
+  downloadAll: (params) => {
+    const qs = new URLSearchParams(Object.fromEntries(Object.entries(params || {}).filter(([, v]) => v))).toString()
+    return downloadFile(`/api/project-files/download-all${qs ? `?${qs}` : ''}`, 'file_cabinet.zip')
+  },
 }
 
 // Workspace (client SharePoint export packages)

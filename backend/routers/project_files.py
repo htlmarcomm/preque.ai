@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Form, BackgroundTasks
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from models.database import get_db, Base, engine, DocumentChunk, ProjectFile
 from pydantic import BaseModel
 from typing import Optional
-import openpyxl, io, os, json, logging
+import openpyxl, io, os, json, logging, zipfile
 from datetime import datetime
 from services.doc_extractor import extract_text, chunk_text
 from services.vector_store import VectorStore
@@ -62,6 +62,40 @@ def read_excel_preview(filepath: str) -> dict:
         }
     wb.close()
     return preview
+
+def _extract_and_index(dest: str, source_id: int, db: Session):
+    """
+    Runs text extraction + chunking + embedding for an uploaded/attached
+    file, off the request path.
+
+    FIX (P0 -- a single malformed file could hang the ENTIRE backend for
+    every user): this used to run synchronously inside the upload request,
+    inside a try/except. That catches a clean failure (extract_text raising),
+    but a corrupt/malformed PDF doesn't fail cleanly -- pdf2image's fallback
+    shells out to poppler's pdftoppm, which can hang indefinitely on garbage
+    input rather than erroring. Since this ran inline in an `async def`
+    route with no `await`/executor offload, that hang blocked the single
+    asyncio event loop thread -- not just that one request, but every other
+    request the backend was serving, including /api/health. Reproduced
+    directly: a fake "test file" saved with a .pdf extension hung the whole
+    server past the point even a health check would respond, until the
+    process was killed. Moving it to a background task means a hang here
+    only leaves that one file's search-indexing incomplete -- the actual
+    upload/attach response the user is waiting on already went out.
+    """
+    try:
+        pages = extract_text(dest)
+        chunks = chunk_text(pages)
+        for chunk in chunks:
+            db.add(DocumentChunk(
+                source_type="project_file", source_id=source_id,
+                sheet_or_page=chunk["sheet_or_page"], chunk_index=chunk["chunk_index"], text=chunk["text"]
+            ))
+        db.commit()
+        VectorStore().embed_missing(db)
+    except Exception as e:
+        logger.warning(f"Failed to extract/index text for project file {source_id}: {e}")
+
 
 @router.get("/categories")
 def get_categories():
@@ -133,22 +167,7 @@ async def upload_file(
     db.refresh(pf)
     
     if dest:
-        try:
-            pages = extract_text(dest)
-            chunks = chunk_text(pages)
-            for chunk in chunks:
-                doc_chunk = DocumentChunk(
-                    source_type="project_file",
-                    source_id=pf.id,
-                    sheet_or_page=chunk["sheet_or_page"],
-                    chunk_index=chunk["chunk_index"],
-                    text=chunk["text"]
-                )
-                db.add(doc_chunk)
-            db.commit()
-            background_tasks.add_task(VectorStore().embed_missing, db)
-        except Exception as e:
-            logger.warning(f"Failed to extract text for project file {pf.id}: {e}")
+        background_tasks.add_task(_extract_and_index, dest, pf.id, db)
 
     return {k: v for k, v in pf.__dict__.items() if not k.startswith("_")}
 
@@ -161,6 +180,43 @@ def update_file(file_id: int, data: FileUpdate, db: Session = Depends(get_db)):
         setattr(pf, k, v)
     db.commit(); db.refresh(pf)
     return {k: v for k, v in pf.__dict__.items() if not k.startswith("_")}
+
+@router.post("/{file_id}/attach-file")
+async def attach_file(file_id: int, background_tasks: BackgroundTasks, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """
+    Attaches an actual file to an EXISTING File Cabinet entry that currently
+    has neither a file nor a SharePoint link -- e.g. the placeholder rows
+    seeded from the default document list (name + category + tags, but no
+    file ever uploaded). Without this there was no way to add the real file
+    to that row short of deleting it and creating a new one from scratch,
+    losing whatever tags/notes/category were already set on it.
+    """
+    pf = db.query(ProjectFile).filter(ProjectFile.id == file_id).first()
+    if not pf: raise HTTPException(404, "File not found")
+    if pf.filename:
+        raise HTTPException(400, "This entry already has a file attached. Delete it first if you want to replace it.")
+
+    safe = sanitize_filename(file.filename)
+    dest = os.path.join(FILES_DIR, safe)
+    contents = await file.read()
+    enforce_upload_size(len(contents))
+    with open(dest, "wb") as f:
+        f.write(contents)
+
+    pf.filename = safe
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(contents), data_only=True, read_only=True)
+        pf.sheet_names = wb.sheetnames
+        pf.row_count = wb.active.max_row or 0
+        wb.close()
+    except Exception:
+        pass
+    db.commit(); db.refresh(pf)
+
+    background_tasks.add_task(_extract_and_index, dest, pf.id, db)
+
+    return {k: v for k, v in pf.__dict__.items() if not k.startswith("_")}
+
 
 @router.delete("/{file_id}")
 def delete_file(file_id: int, db: Session = Depends(get_db)):
@@ -194,6 +250,66 @@ def download_file(file_id: int, db: Session = Depends(get_db)):
     path = os.path.join(FILES_DIR, pf.filename)
     if not os.path.exists(path): raise HTTPException(404, "File missing")
     return FileResponse(path, filename=pf.filename)
+
+# Route lives at the router root ("/download-all"), not under "/{file_id}/...",
+# so it can't collide with download_file above regardless of registration
+# order -- the path shapes are different, not the same prefix with a
+# different suffix.
+@router.get("/download-all")
+def download_all_files(
+    client:   Optional[str] = None,
+    category: Optional[str] = None,
+    search:   Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Zips every File Cabinet entry that has an actual uploaded file (skips
+    SharePoint-link-only entries -- there's no local file to zip for those)
+    and streams it back as one .zip. Accepts the same client/category/search
+    filters as the list endpoint, so "download all" respects whatever the
+    user currently has filtered/searched for, not literally every file in
+    the system regardless of view.
+    """
+    q = db.query(ProjectFile)
+    if client:   q = q.filter(ProjectFile.client.ilike(f"%{client}%"))
+    if category: q = q.filter(ProjectFile.category == category)
+    if search:
+        q = q.filter(
+            ProjectFile.name.ilike(f"%{search}%") |
+            ProjectFile.client.ilike(f"%{search}%") |
+            ProjectFile.notes.ilike(f"%{search}%")
+        )
+    files = q.filter(ProjectFile.filename.isnot(None)).order_by(ProjectFile.category, ProjectFile.name).all()
+    if not files:
+        raise HTTPException(404, "No downloadable files match the current filters.")
+
+    buf = io.BytesIO()
+    # Duplicate display names (two files both called "Insurance Certificate",
+    # a common real-world case since `name` isn't unique) would silently
+    # overwrite each other inside the zip otherwise -- number any repeat.
+    used_names = {}
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for pf in files:
+            path = os.path.join(FILES_DIR, pf.filename)
+            if not os.path.exists(path):
+                continue  # DB row survives a missing file on disk elsewhere in this router; skip rather than 500 the whole batch
+            ext = os.path.splitext(pf.filename)[1]
+            base = sanitize_filename(pf.name or pf.filename) or "file"
+            base = os.path.splitext(base)[0]
+            category_dir = (pf.category or "Uncategorized").replace("/", "-")
+            arcname = f"{category_dir}/{base}{ext}"
+            n = used_names.get(arcname, 0)
+            if n:
+                arcname = f"{category_dir}/{base} ({n}){ext}"
+            used_names[f"{category_dir}/{base}{ext}"] = n + 1
+            zf.write(path, arcname)
+
+    buf.seek(0)
+    zip_filename = f"file_cabinet_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
+    return StreamingResponse(
+        buf, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_filename}"'}
+    )
 
 # FIX (P0 -- stored XSS via file upload): serving an arbitrary uploaded file
 # "inline" lets the browser render it in this API's own origin using

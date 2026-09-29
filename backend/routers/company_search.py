@@ -1,8 +1,12 @@
 from fastapi import APIRouter, Depends, Query, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
+from pydantic import BaseModel
 from typing import Optional, List
+from datetime import datetime
 import openpyxl, io, re
+from openpyxl.utils import get_column_letter
 from models.database import get_db, CompanyField, FinancialRecord, ProjectReference
 
 router = APIRouter()
@@ -159,6 +163,63 @@ def get_project_references(
         "page": page,
         "page_size": page_size,
     }
+
+
+class ExportReferencesRequest(BaseModel):
+    ids: List[int]
+
+
+@router.post("/project-references/export")
+def export_project_references(req: ExportReferencesRequest, db: Session = Depends(get_db)):
+    """
+    Builds a standalone .xlsx from a user-picked subset of the Project
+    References table (checkbox-selected in the Company Database UI) --
+    e.g. to hand a client the specific past-project references relevant to
+    their RFP, without exporting the whole (often thousand-plus-row) table.
+    """
+    if not req.ids:
+        raise HTTPException(400, "No references selected.")
+
+    refs = db.query(ProjectReference).filter(ProjectReference.id.in_(req.ids)).all()
+    by_id = {r.id: r for r in refs}
+    # Preserve the order the user selected/checked them in, not DB order.
+    ordered = [by_id[i] for i in req.ids if i in by_id]
+    if not ordered:
+        raise HTTPException(404, "None of the selected references were found.")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Client References"
+
+    headers = [
+        "Project Name", "Client", "Location", "Region", "Consultant", "PMC", "Third Party",
+        "Sector", "Type", "Area (Sqft)", "Value", "Status", "Start Date", "End Date",
+        "Contact Name", "Designation", "Phone", "Email", "Certifications",
+    ]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = cell.font.copy(bold=True)
+
+    for r in ordered:
+        ws.append([
+            r.project_name, r.client_name, r.location, r.region, r.consultant, r.pmc, r.third_party,
+            r.project_sector, r.project_type, r.area_sqft, r.project_value, r.status, r.start_date, r.end_date,
+            r.client_rep_name, r.client_rep_designation, r.client_rep_phone, r.client_rep_email, r.certifications,
+        ])
+
+    for i, header in enumerate(headers, start=1):
+        col = get_column_letter(i)
+        longest = max([len(header)] + [len(str(ws.cell(row=r, column=i).value or "")) for r in range(2, ws.max_row + 1)])
+        ws.column_dimensions[col].width = min(max(longest + 2, 12), 45)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = f"client_references_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return StreamingResponse(
+        buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
 
 
 @router.get("/project-references/filter-options")

@@ -33,6 +33,8 @@ export default function ProjectFiles() {
   const [loading, setLoading]           = useState(false)
   const [previewLoading, setPreviewLoading] = useState(false)
   const [downloadingId, setDownloadingId] = useState(null)
+  const [downloadingAll, setDownloadingAll] = useState(false)
+  const [downloadingEach, setDownloadingEach] = useState(null) // { done, total } while running
   const mediaObjectUrlRef = useRef(null)
 
   useEffect(() => { fetchFiles(); fetchCategories() }, [])
@@ -71,6 +73,24 @@ export default function ProjectFiles() {
     fetchFiles()
   }
 
+  const [attachingId, setAttachingId] = useState(null)
+  // For entries with neither a file nor a SharePoint link (e.g. placeholder
+  // rows seeded from the default document list) -- lets a real file be
+  // attached to that SAME row instead of needing to delete it and create a
+  // new entry from scratch, which would lose its existing tags/category.
+  async function attachFile(id, file) {
+    if (!file) return
+    setAttachingId(id)
+    try {
+      await projectFilesApi.attachFile(id, file)
+      fetchFiles()
+    } catch (e) {
+      alert(e.response?.data?.detail || e.message || 'Could not attach file.')
+    } finally {
+      setAttachingId(null)
+    }
+  }
+
   async function downloadFileById(file) {
     setDownloadingId(file.id)
     try {
@@ -80,6 +100,52 @@ export default function ProjectFiles() {
     } finally {
       setDownloadingId(null)
     }
+  }
+
+  // Respects whatever search/client/category filters are currently active,
+  // rather than always zipping literally every file regardless of view --
+  // matches what "Download All" visually implies when a filter is applied.
+  // FIX: zipping the full ~160-file cabinet measured at 3m20s server-side
+  // (it builds the whole archive in memory before the download can start,
+  // so nothing streams back early) -- with only a spinner + "Zipping…"
+  // during that wait, it looks indistinguishable from a hung tab. Warn
+  // first for a large batch so a multi-minute wait is expected, not a
+  // sign something broke.
+  async function downloadAllFiles() {
+    const downloadableCount = files.filter(f => f.filename).length
+    if (downloadableCount > 30) {
+      const ok = confirm(`This will zip ${downloadableCount} files, which can take a few minutes. Continue?`)
+      if (!ok) return
+    }
+    setDownloadingAll(true)
+    try {
+      await projectFilesApi.downloadAll({ client: filterClient, category: filterCat, search })
+    } catch (e) {
+      alert(e.response?.data?.detail || e.message || 'Download failed.')
+    } finally {
+      setDownloadingAll(false)
+    }
+  }
+
+  // Downloads every currently-filtered file as its own separate file (not
+  // zipped) -- browsers throttle/block a burst of simultaneous downloads
+  // triggered in the same tick, so these go out one at a time with a short
+  // gap between each rather than all at once via Promise.all.
+  async function downloadEachFileIndividually() {
+    const downloadable = files.filter(f => f.filename)
+    if (downloadable.length === 0) return
+    setDownloadingEach({ done: 0, total: downloadable.length })
+    for (let i = 0; i < downloadable.length; i++) {
+      const f = downloadable[i]
+      try {
+        await projectFilesApi.download(f.id, f.filename || f.name)
+      } catch (e) {
+        console.error(`Failed to download "${f.name}":`, e)
+      }
+      setDownloadingEach({ done: i + 1, total: downloadable.length })
+      if (i < downloadable.length - 1) await new Promise(r => setTimeout(r, 400))
+    }
+    setDownloadingEach(null)
   }
 
   // Object URLs used for inline PDF/image previews must be revoked once
@@ -181,6 +247,18 @@ export default function ProjectFiles() {
           <p style={{ margin: '2px 0 0', fontSize: 13, color: '#64748b' }}>{files.length} file{files.length !== 1 ? 's' : ''} stored</p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
+          <button onClick={downloadAllFiles} disabled={downloadingAll || files.length === 0}
+            title={filterClient || filterCat || search ? 'Downloads only the currently filtered files, bundled into one .zip' : 'Downloads every file in File Cabinet, bundled into one .zip'}
+            style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 14px', background: '#fff', color: '#374151', border: '1.5px solid #d1d5db', borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: downloadingAll || files.length === 0 ? 'default' : 'pointer', opacity: downloadingAll || files.length === 0 ? 0.6 : 1 }}>
+            {downloadingAll ? <Loader2 size={15} className="animate-spin" /> : <Download size={15} />}
+            {downloadingAll ? 'Zipping…' : 'Download All (.zip)'}
+          </button>
+          <button onClick={downloadEachFileIndividually} disabled={!!downloadingEach || files.length === 0}
+            title={filterClient || filterCat || search ? 'Downloads the currently filtered files one at a time as separate files' : 'Downloads every file one at a time as separate files'}
+            style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 14px', background: '#fff', color: '#374151', border: '1.5px solid #d1d5db', borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: downloadingEach || files.length === 0 ? 'default' : 'pointer', opacity: downloadingEach || files.length === 0 ? 0.6 : 1 }}>
+            {downloadingEach ? <Loader2 size={15} className="animate-spin" /> : <Download size={15} />}
+            {downloadingEach ? `Downloading ${downloadingEach.done}/${downloadingEach.total}…` : 'Download Each File'}
+          </button>
           <button onClick={() => { setShowLink(false); setShowUpload(v => !v) }}
             style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 14px', background: '#dc2626', color: '#fff', border: 'none', borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
             <Upload size={15} /> Upload File
@@ -258,6 +336,8 @@ export default function ProjectFiles() {
               downloadingId={downloadingId}
               categories={categories}
               onUpdateCategory={updateFileCategory}
+              onAttach={attachFile}
+              attachingId={attachingId}
             />
           ))
         )}
@@ -392,7 +472,7 @@ export default function ProjectFiles() {
 }
 
 /* ── Category Group ── */
-function CategoryGroup({ cat, files, collapsed, onToggle, onPreview, onDelete, onDownload, downloadingId, categories, onUpdateCategory }) {
+function CategoryGroup({ cat, files, collapsed, onToggle, onPreview, onDelete, onDownload, downloadingId, categories, onUpdateCategory, onAttach, attachingId }) {
   const color = CATEGORY_COLORS[cat] || '#6b7280'
   return (
     <div style={{ marginBottom: 14, background: '#fff', borderRadius: 10, border: '1.5px solid #e2e8f0', overflow: 'hidden' }}>
@@ -405,7 +485,7 @@ function CategoryGroup({ cat, files, collapsed, onToggle, onPreview, onDelete, o
       </button>
       {!collapsed && (
         <div style={{ borderTop: '1px solid #f1f5f9' }}>
-          {files.map(f => <FileRow key={f.id} file={f} onPreview={onPreview} onDelete={onDelete} onDownload={onDownload} downloadingId={downloadingId} categories={categories} onUpdateCategory={onUpdateCategory} />)}
+          {files.map(f => <FileRow key={f.id} file={f} onPreview={onPreview} onDelete={onDelete} onDownload={onDownload} downloadingId={downloadingId} categories={categories} onUpdateCategory={onUpdateCategory} onAttach={onAttach} attachingId={attachingId} />)}
         </div>
       )}
     </div>
@@ -413,7 +493,9 @@ function CategoryGroup({ cat, files, collapsed, onToggle, onPreview, onDelete, o
 }
 
 /* ── File Row ── */
-function FileRow({ file, onPreview, onDelete, onDownload, downloadingId, categories, onUpdateCategory }) {
+function FileRow({ file, onPreview, onDelete, onDownload, downloadingId, categories, onUpdateCategory, onAttach, attachingId }) {
+  const attachInputRef = useRef()
+  const hasNothing = !file.filename && !file.sharepoint_link
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 16px', borderBottom: '1px solid #f8fafc', flexWrap: 'wrap' }}>
       {file.filename && !['xlsx', 'xls', 'csv'].includes(file.filename.split('.').pop().toLowerCase()) 
@@ -465,6 +547,25 @@ function FileRow({ file, onPreview, onDelete, onDownload, downloadingId, categor
             <button onClick={() => onDownload(file)} disabled={downloadingId === file.id}
               style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '5px 10px', background: '#f0fdf4', border: 'none', borderRadius: 6, fontSize: 11, color: '#10b981', cursor: 'pointer' }}>
               {downloadingId === file.id ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />} Download
+            </button>
+          </>
+        )}
+        {/* No file and no SharePoint link -- these are the placeholder rows
+            seeded from the default document list. There's genuinely nothing
+            to preview/download yet, so surface that clearly instead of just
+            silently omitting the buttons (which is exactly what looked like
+            a missing feature). Lets a real file be attached right onto this
+            same row rather than deleting it and starting over. */}
+        {hasNothing && (
+          <>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '5px 10px', background: '#f8fafc', border: '1px dashed #cbd5e1', borderRadius: 6, fontSize: 11, color: '#94a3b8' }}>
+              No file yet
+            </span>
+            <input ref={attachInputRef} type="file" style={{ display: 'none' }}
+              onChange={e => { onAttach(file.id, e.target.files[0]); e.target.value = '' }} />
+            <button onClick={() => attachInputRef.current?.click()} disabled={attachingId === file.id}
+              style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '5px 10px', background: '#eff6ff', border: 'none', borderRadius: 6, fontSize: 11, color: '#2563eb', cursor: 'pointer', fontWeight: 600 }}>
+              {attachingId === file.id ? <Loader2 size={12} className="animate-spin" /> : <Upload size={12} />} Attach file
             </button>
           </>
         )}

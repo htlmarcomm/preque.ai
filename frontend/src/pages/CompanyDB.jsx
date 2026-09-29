@@ -31,6 +31,13 @@ export default function CompanyDB() {
   const [projTotal, setProjTotal] = useState(0)
   const [projPage, setProjPage] = useState(1)
   const [projLoadingRecords, setProjLoadingRecords] = useState(false)
+  // Kept as a Set of ids so a selection survives paging/filtering (the
+  // table is server-paginated -- unlike the other tabs' client-side
+  // filtering -- so "select some, then page forward" is a normal flow here,
+  // and the export should include everything picked across pages, not just
+  // whatever's currently rendered).
+  const [selectedProjectIds, setSelectedProjectIds] = useState(new Set())
+  const [exportingRefs, setExportingRefs] = useState(false)
 
   // Project Details state
   const [pdFiles, setPdFiles] = useState([])
@@ -85,6 +92,37 @@ export default function CompanyDB() {
       setProjTotal(res.data.total || 0)
     } finally {
       setProjLoadingRecords(false)
+    }
+  }
+
+  const toggleProjectSelection = (id) => {
+    setSelectedProjectIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const currentPageAllSelected = projects.length > 0 && projects.every(p => selectedProjectIds.has(p.id))
+  const toggleSelectAllOnPage = () => {
+    setSelectedProjectIds(prev => {
+      const next = new Set(prev)
+      if (currentPageAllSelected) projects.forEach(p => next.delete(p.id))
+      else projects.forEach(p => next.add(p.id))
+      return next
+    })
+  }
+
+  const exportSelectedReferences = async () => {
+    if (selectedProjectIds.size === 0) return
+    setExportingRefs(true)
+    try {
+      await companyApi.exportProjectReferences(Array.from(selectedProjectIds))
+    } catch (e) {
+      alert(e.response?.data?.detail || e.message || 'Export failed.')
+    } finally {
+      setExportingRefs(false)
     }
   }
 
@@ -652,6 +690,19 @@ export default function CompanyDB() {
           </div>
         ) : (
           <>
+            {selectedProjectIds.size > 0 && (
+              <div className="flex items-center justify-between bg-brand-50 border border-brand-100 rounded-xl px-4 py-2.5 mb-3">
+                <span className="text-sm font-medium text-brand-700">{selectedProjectIds.size} reference{selectedProjectIds.size !== 1 ? 's' : ''} selected</span>
+                <div className="flex items-center gap-3">
+                  <button onClick={() => setSelectedProjectIds(new Set())} className="text-xs text-gray-500 hover:text-gray-700">Clear selection</button>
+                  <button onClick={exportSelectedReferences} disabled={exportingRefs}
+                    className="btn-primary text-xs py-1.5 px-3">
+                    {exportingRefs ? <Loader2 size={13} className="animate-spin" /> : <FileText size={13} />}
+                    {exportingRefs ? 'Exporting…' : `Export ${selectedProjectIds.size} to Excel`}
+                  </button>
+                </div>
+              </div>
+            )}
             <div className="card overflow-x-auto min-h-[300px] relative">
               {projLoadingRecords && (
                 <div className="absolute inset-0 bg-white/50 flex items-center justify-center z-10">
@@ -661,6 +712,10 @@ export default function CompanyDB() {
               <table className="w-full text-sm text-left">
                 <thead className="bg-gray-50 border-b border-gray-100 text-xs text-gray-500 uppercase tracking-wider">
                   <tr>
+                    <th className="px-4 py-3 font-medium w-10">
+                      <input type="checkbox" checked={currentPageAllSelected} onChange={toggleSelectAllOnPage}
+                        title="Select all on this page" className="w-3.5 h-3.5" />
+                    </th>
                     <th className="px-4 py-3 font-medium">Project Name</th>
                     <th className="px-4 py-3 font-medium">Client</th>
                     <th className="px-4 py-3 font-medium">Location</th>
@@ -678,7 +733,10 @@ export default function CompanyDB() {
                 </thead>
                 <tbody className="divide-y divide-gray-100">
                   {projects.map(p => (
-                    <tr key={p.id} className="hover:bg-gray-50">
+                    <tr key={p.id} className={`hover:bg-gray-50 ${selectedProjectIds.has(p.id) ? 'bg-brand-50/50' : ''}`}>
+                      <td className="px-4 py-3">
+                        <input type="checkbox" checked={selectedProjectIds.has(p.id)} onChange={() => toggleProjectSelection(p.id)} className="w-3.5 h-3.5" />
+                      </td>
                       <td className="px-4 py-3 font-medium text-gray-900 max-w-[250px] truncate" title={p.project_name || p.client_name}>
                         {p.project_name || <span className="text-gray-400 italic">{p.client_name || '(unnamed)'}</span>}
                         <div className="text-[10px] text-gray-400 font-normal mt-0.5">{p.region}</div>
