@@ -201,3 +201,39 @@ class ProjectDataSheet(Base):
     parser_used = Column(String(50))  # "tabular" | "vertical_block" | "bulleted_cell"
     first_uploaded_at = Column(DateTime, default=datetime.utcnow)
     last_updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class UnifiedProject(Base):
+    """One row per distinct project, merged from every project source (sector
+    register, File Cabinet project registry files, consolidated master). This is
+    the single table the deck app picks projects from."""
+    __tablename__ = "unified_projects"
+    id = Column(Integer, primary_key=True, index=True)
+    project_name = Column(String(400), index=True)
+    client_name = Column(String(300), index=True)
+    third_party = Column(String(300))
+    sector = Column(String(100), index=True)          # normalized sector taxonomy
+    sector_raw = Column(String(150))
+    scope = Column(String(100), index=True)           # VRV / NVRV / Chiller / Fitout / HVAC / MEP ...
+    city = Column(String(100), index=True)
+    location = Column(String(300))
+    area_sqft = Column(Float, nullable=True)
+    value_cr = Column(Float, nullable=True)           # contract value, Rs Crore
+    start_date = Column(String(20))                   # ISO yyyy-mm-dd
+    end_date = Column(String(20))
+    year = Column(Integer, index=True)
+    status = Column(String(30), index=True)           # Completed | Ongoing | Unknown
+    pmc = Column(String(200))
+    consultant = Column(String(300))
+    architect = Column(String(300))
+    manager = Column(String(150))
+    contact_name = Column(String(200))
+    contact_designation = Column(String(200))
+    contact_email = Column(String(200))
+    contact_phone = Column(String(100))
+    description = Column(Text)
+    record_level = Column(String(20), default="project", index=True)  # project | client_rollup
+    sources = Column(JSON)                            # [{"file":..., "sheet":...}]
+    dedupe_key = Column(String(500), index=True)
+    selected_for_deck = Column(Boolean, default=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)

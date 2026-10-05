@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
-from routers import company_data, company_search, forms, documents, agent, project_files, workspace, google, search, subcontractors, project_data, project_picker, auth_router
+from routers import company_data, company_search, forms, documents, agent, project_files, workspace, google, search, subcontractors, project_data, project_picker, auth_router, unified_projects
 from models.database import engine, Base, SessionLocal, User
 from auth import require_user, client_ip, hash_password
 
@@ -35,6 +35,23 @@ def _migrate_project_reference_columns():
                 pass  # column already exists
 
 _migrate_project_reference_columns()
+
+
+def _seed_unified_projects():
+    # Populate the unified project table on first boot (empty table) from the bundled data_sources/ workbooks.
+    from models.database import SessionLocal, UnifiedProject
+    from services import unified_projects as _up
+    db = SessionLocal()
+    try:
+        if db.query(UnifiedProject).count() == 0:
+            print("Unified projects:", _up.rebuild(db))
+    except Exception as e:  # never block startup on seed data
+        print("Unified projects seed failed:", e)
+    finally:
+        db.close()
+
+
+_seed_unified_projects()
 
 # First-boot admin seeding: if no users exist yet, create one from
 # INITIAL_ADMIN_USERNAME/INITIAL_ADMIN_PASSWORD env vars so there's a way to
@@ -108,6 +125,7 @@ app.include_router(search.router, prefix="/api/search", tags=["Search"], depende
 app.include_router(subcontractors.router, prefix="/api/subcontractors", tags=["Subcontractors"], dependencies=api_auth)
 app.include_router(project_data.router, prefix="/api/project-data", tags=["Project Data"], dependencies=api_auth)
 app.include_router(project_picker.router, prefix="/api/project-picker", tags=["Project Picker"], dependencies=api_auth)
+app.include_router(unified_projects.router, prefix="/api/unified-projects", tags=["Unified Projects"], dependencies=api_auth)
 
 # Always available, unauthenticated (registered directly on `app`, not
 # through one of the api_auth-gated routers above) -- this is what the

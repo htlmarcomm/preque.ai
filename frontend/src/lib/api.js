@@ -260,6 +260,16 @@ export const projectPickerApi = {
     }),
 }
 
+export const unifiedProjectsApi = {
+  list: (params) => api.get('/api/unified-projects/', { params }),
+  filterOptions: () => api.get('/api/unified-projects/filter-options'),
+  stats: () => api.get('/api/unified-projects/stats'),
+  select: (ids, selected) => api.post('/api/unified-projects/select', { ids, selected }),
+  clearSelection: () => api.post('/api/unified-projects/clear-selection'),
+  rebuild: () => api.post('/api/unified-projects/rebuild', null, { timeout: 180000 }),
+  export: (ids) => downloadFile2Post('/api/unified-projects/export', { ids }, 'unified_projects.xlsx'),
+}
+
 export const projectHistoryApi = {
   getAll: () => api.get('/api/projects/'),
   create: (data) => api.post('/api/projects/', data),

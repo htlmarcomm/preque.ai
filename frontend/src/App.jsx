@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
-import { Database, FileText, FolderOpen, History, Zap, Archive, Briefcase, Search, Users, LogOut } from 'lucide-react'
+import { Database, FileText, FolderOpen, History, Zap, Archive, Briefcase, Search, Users, LogOut, Layers } from 'lucide-react'
 import FillForm from './pages/FillForm'
 import CompanyDB from './pages/CompanyDB'
 import FormHistory from './pages/FormHistory'
@@ -10,6 +10,7 @@ import Workspace from './pages/Workspace'
 import DocumentSearch from './pages/DocumentSearch'
 import SubContractors from './pages/SubContractors'
 import ProjectHistory from './pages/ProjectHistory'
+import UnifiedProjects from './pages/UnifiedProjects'
 import Login from './pages/Login'
 import { authApi, getToken, clearToken } from './lib/api'
 
@@ -28,6 +29,7 @@ const navItems = [
   { to: '/documents', icon: FileText,   label: 'Documents'    },
   { to: '/workspaces',icon: Briefcase,  label: 'Workspaces'   },
   { to: '/subcontractors', icon: Users, label: 'Subcontractors' },
+  { to: '/unified', icon: Layers, label: 'Unified Projects' },
   { to: '/projects', icon: Briefcase, label: 'Project History' },
   { to: '/search',    icon: Search,     label: 'Document Search' },
 ]
@@ -101,6 +103,7 @@ export default function App() {
             <Route path="/documents" element={<Documents />} />
             <Route path="/workspaces" element={<Workspace />} />
             <Route path="/subcontractors" element={<SubContractors />} />
+            <Route path="/unified" element={<UnifiedProjects />} />
             <Route path="/projects" element={<ProjectHistory />} />
             <Route path="/search" element={<DocumentSearch />} />
           </Routes>
