@@ -29,7 +29,9 @@ export default function UnifiedPicker({ table, selected, setSelected, cap }) {
       const yearsBack = Number(table.years_back) || 0
       setF({
         q: '',
-        status: table.status_filter || '',
+        // Many register rows have no end date, so their status is 'Unknown'. A "completed work"
+        // table should still offer them; only the ones known to be ongoing are left out.
+        status: table.status_filter === 'Completed' ? 'Completed,Unknown' : (table.status_filter || ''),
         sector: matchSector(table.sector_hint, data.sector || []),
         // The form's wording ("MEP works") rarely matches the register's scope labels (VRV, Fitout, ...),
         // so the scope hint is not applied automatically; it would hide most projects.
@@ -43,7 +45,7 @@ export default function UnifiedPicker({ table, selected, setSelected, cap }) {
 
   const params = useMemo(() => {
     if (!f) return null
-    const p = { page, page_size: 50, sort: f.sort, level: 'project' }
+    const p = { page, page_size: 50, sort: f.sort, level: 'project', keep_unknown_year: true }
     for (const k of ['q', 'status', 'sector', 'scope', 'year_from', 'min_value']) if (f[k] !== '') p[k] = f[k]
     return p
   }, [f, page])
@@ -97,7 +99,13 @@ export default function UnifiedPicker({ table, selected, setSelected, cap }) {
           <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" />
           <input type="text" value={f.q} onChange={(e) => set('q', e.target.value)} placeholder="Search project, client, PMC…" className="input w-full pl-8 py-1.5 text-xs" />
         </div>
-        <Sel k="status" label="Any status" values={['Completed', 'Ongoing', 'Unknown']} />
+        <select className="input text-xs py-1" value={f.status} onChange={(e) => set('status', e.target.value)}>
+          <option value="">Any status</option>
+          <option value="Completed,Unknown">Completed / not confirmed</option>
+          <option value="Completed">Completed only</option>
+          <option value="Ongoing">Ongoing</option>
+          <option value="Unknown">Status not confirmed</option>
+        </select>
         <Sel k="sector" label="All categories" values={opts.sector} />
         <Sel k="scope" label="All scopes" values={opts.scope} />
         <Sel k="year_from" label="From year" values={opts.year} />

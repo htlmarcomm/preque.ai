@@ -10,7 +10,7 @@ from routers.forms import (
     build_company_context, get_doc_checklist,
     openai_client, VISION_MODEL, UPLOAD_DIR, OUTPUT_DIR,
     excel_to_all_sheet_maps, build_workbook_form_json,
-    find_field_value_in_record
+    find_field_value_in_record, free_table_rows
 )
 from typing import Optional
 import os, json, base64, re, shutil, io
@@ -432,15 +432,51 @@ def _fmt_amount(value_cr, unit):
     return round(v, 2) if unit != "inr" else int(round(v))
 
 
-def unified_field_values(up, unit=None) -> dict:
-    """Canonical table-field key -> cell value for one UnifiedProject row."""
+# The register's sector / scope labels, worded the way pre-qualification forms usually ask
+# ("Type of Project: Hotel, Residential, Commercial ..."; "Scope: Electrical / PLB / HVAC").
+_TYPE_LABELS = {
+    "Hospitality & Hotels": "Hotel", "Healthcare & Hospitals": "Hospital", "Data Centres": "Data Centre",
+    "Industrial & Manufacturing": "Industrial", "Education & Institutions": "Educational",
+    "Residential": "Residential", "Retail & Luxury": "Retail", "Government & Infrastructure": "Infrastructure",
+    "Coworking": "Commercial (Co-working)", "Pharma & Biotech": "Pharma",
+    "Corporate Offices": "Commercial (Office)", "Corporate - BFSI": "Commercial (Office)",
+    "IT / GCC / Technology": "Commercial (IT Office)", "Commercial / Other": "Commercial",
+}
+_SCOPE_LABELS = {"VRV": "HVAC", "NVRV": "HVAC", "Chiller": "HVAC", "Refrigeration": "HVAC", "Fitout": "Fit-out",
+                 "Services": "MEP Services"}
+
+
+def _form_scope(scope):
+    if not scope:
+        return None
+    parts = []
+    for part in scope.split(", "):
+        label = _SCOPE_LABELS.get(part, part)
+        if label not in parts:
+            parts.append(label)
+    return " & ".join(parts)
+
+
+def unified_field_values(up, unit=None, keys=()) -> dict:
+    """Canonical table-field key -> cell value for one UnifiedProject row.
+
+    `keys` are the table's mapped fields. When the table has no separate project-name column,
+    its Client cell carries "Project (Client)" so the project is still identifiable.
+    """
+    client = up.client_name
+    if "project_name" not in keys:
+        name = up.project_name or ""
+        if client and re.sub(r"\W+", "", client.lower()) not in re.sub(r"\W+", "", name.lower()):
+            client = f"{name} ({client})" if name else client
+        else:
+            client = name or client
     return {
         "project_name": up.project_name,
-        "client_name": up.client_name or up.project_name,
-        "project_type": up.sector,
+        "client_name": client or up.project_name,
+        "project_type": _TYPE_LABELS.get(up.sector, up.sector),
         "location": up.location or up.city,
         "main_contractor": up.third_party,
-        "scope_of_work": up.scope,
+        "scope_of_work": _form_scope(up.scope),
         "area_sqft": round(up.area_sqft) if up.area_sqft else None,
         "amount": _fmt_amount(up.value_cr, unit),
         "start_date": _fmt_date(up.start_date),
@@ -517,7 +553,7 @@ def fill_project_table(
             from models.database import UnifiedProject
             ups = {u.id: u for u in db.query(UnifiedProject).filter(UnifiedProject.id.in_(ids_to_fill)).all()}
             for uid, block_start in zip([i for i in ids_to_fill if i in ups], block_start_rows):
-                vals = unified_field_values(ups[uid], target_table.get("amount_unit"))
+                vals = unified_field_values(ups[uid], target_table.get("amount_unit"), field_row_offsets.keys())
                 for field_key, offset in field_row_offsets.items():
                     val = vals.get(field_key)
                     if val not in (None, ""):
@@ -583,13 +619,7 @@ def fill_project_table(
         sheet_maps, _, _, _ = excel_to_all_sheet_maps(file_bytes)
         cmap = sheet_maps.get(req.sheet_name, "")
 
-        available_rows = []
-        first_col = next(iter(mapping.values())) if mapping else None
-        if first_col:
-            r = start_row
-            while f"[{first_col}{r}]=EMPTY" in cmap:
-                available_rows.append(r)
-                r += 1
+        available_rows = free_table_rows(cmap, mapping, start_row) if mapping else []
 
         if not available_rows:
             available_rows = list(range(start_row, start_row + len(req.selected_ids)))
@@ -602,7 +632,7 @@ def fill_project_table(
             from models.database import UnifiedProject
             ups = {u.id: u for u in db.query(UnifiedProject).filter(UnifiedProject.id.in_(ids_to_fill)).all()}
             for uid, row_num in zip([i for i in ids_to_fill if i in ups], available_rows):
-                vals = unified_field_values(ups[uid], target_table.get("amount_unit"))
+                vals = unified_field_values(ups[uid], target_table.get("amount_unit"), mapping.keys())
                 for m_key, m_col in mapping.items():
                     val = vals.get(m_key)
                     if val not in (None, ""):

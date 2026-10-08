@@ -23,7 +23,7 @@ def _row(p):
     return {c: getattr(p, c) for c in COLUMNS}
 
 
-def _filtered(db, q, sector, city, scope, status, year_from, year_to, min_value, max_value, level, selected, pmc):
+def _filtered(db, q, sector, city, scope, status, year_from, year_to, min_value, max_value, level, selected, pmc, keep_unknown_year=False):
     qs = db.query(UnifiedProject)
     if level != "all":
         qs = qs.filter(UnifiedProject.record_level == level)
@@ -35,11 +35,14 @@ def _filtered(db, q, sector, city, scope, status, year_from, year_to, min_value,
     if scope:   # scope may hold several values ("Chiller, Fitout")
         qs = qs.filter(UnifiedProject.scope.ilike(f"%{scope}%"))
     for col, val in ((UnifiedProject.sector, sector), (UnifiedProject.city, city),
-                     (UnifiedProject.status, status), (UnifiedProject.pmc, pmc)):
+                     (UnifiedProject.pmc, pmc)):
         if val:
             qs = qs.filter(col == val)
+    if status:   # one status or a comma list, e.g. "Completed,Unknown"
+        qs = qs.filter(UnifiedProject.status.in_([x.strip() for x in status.split(",") if x.strip()]))
     if year_from:
-        qs = qs.filter(UnifiedProject.year >= year_from)
+        cond = UnifiedProject.year >= year_from
+        qs = qs.filter(or_(cond, UnifiedProject.year.is_(None)) if keep_unknown_year else cond)
     if year_to:
         qs = qs.filter(UnifiedProject.year <= year_to)
     if min_value is not None:
@@ -56,10 +59,10 @@ def list_projects(
     q: Optional[str] = None, sector: Optional[str] = None, city: Optional[str] = None, scope: Optional[str] = None,
     status: Optional[str] = None, pmc: Optional[str] = None, year_from: Optional[int] = None,
     year_to: Optional[int] = None, min_value: Optional[float] = None, max_value: Optional[float] = None,
-    level: str = "project", selected: Optional[bool] = None, sort: str = "value_desc",
+    level: str = "project", selected: Optional[bool] = None, sort: str = "value_desc", keep_unknown_year: bool = False,
     page: int = 1, page_size: int = Query(50, le=500), db: Session = Depends(get_db),
 ):
-    qs = _filtered(db, q, sector, city, scope, status, year_from, year_to, min_value, max_value, level, selected, pmc)
+    qs = _filtered(db, q, sector, city, scope, status, year_from, year_to, min_value, max_value, level, selected, pmc, keep_unknown_year)
     total = qs.count()
     order = {"value_desc": UnifiedProject.value_cr.desc().nullslast(), "area_desc": UnifiedProject.area_sqft.desc().nullslast(),
              "year_desc": UnifiedProject.year.desc().nullslast(), "name": UnifiedProject.project_name.asc()}.get(sort)

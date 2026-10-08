@@ -1049,6 +1049,54 @@ def _default_sheet_analysis() -> dict:
     }
 
 
+def _compact_cell_map(cell_map: str, limit: int = 24000) -> str:
+    """Shrink a cell map for the sheet-analysis prompt.
+
+    A wide form (merged cells spread over 50 columns) lists dozens of `[X12]=EMPTY` tokens per
+    row, so the project tables near the bottom used to sit past the prompt's character cap and
+    were never seen. Here rows keep only their non-empty cells; runs of fully empty rows
+    collapse to one `rows A-B: blank` line, which still tells the model where blank table rows are.
+    """
+    out, blank_start, blank_end = [], None, None
+
+    def flush():
+        nonlocal blank_start, blank_end
+        if blank_start is not None:
+            out.append(f"rows {blank_start}-{blank_end}: blank" if blank_end != blank_start else f"row {blank_start}: blank")
+            blank_start = blank_end = None
+
+    for line in cell_map.splitlines():
+        m = re.match(r'\[[A-Z]+(\d+)\]', line)
+        if not m:
+            flush(); out.append(line); continue
+        row = int(m.group(1))
+        kept = " ".join(t for t in re.findall(r"\[[A-Z]+\d+\]=(?:'[^']*'|\"[^\"]*\"|[^\s\[]+)", line) if not t.endswith("=EMPTY"))
+        if not kept:
+            if blank_start is None:
+                blank_start = row
+            blank_end = row
+        else:
+            flush(); out.append(kept)
+    flush()
+    return "\n".join(out)[:limit]
+
+
+def free_table_rows(cmap: str, mapping: dict, start_row: int, limit: int = 60) -> list:
+    """Consecutive rows from start_row where every mapped column is still blank.
+
+    A row the cell map doesn't list at all (no border/format, so openpyxl never created the
+    cell) counts as blank. The run stops at the first row where any mapped column holds
+    content: a filled row, or whatever heading follows the table.
+    """
+    cols = list(dict.fromkeys(mapping.values()))
+    rows = []
+    for r in range(start_row, start_row + limit):
+        if any(re.search(rf"\[{c}{r}\]=(?!EMPTY)", cmap) for c in cols):
+            break
+        rows.append(r)
+    return rows
+
+
 def _as_table_list(data: dict) -> list:
     """The analysis may return `project_tables` (list) or the older single `project_table`."""
     tables = data.get("project_tables")
@@ -1087,7 +1135,7 @@ def analyze_sheet(sheet_name: str, cell_map: str) -> dict:
                 "role": "user",
                 "content": SHEET_ANALYSIS_PROMPT.format(
                     sheet_name=sheet_name,
-                    cell_map=cell_map[:16000]  # stacked project tables can sit far down the sheet; 6000 cut the lower ones off
+                    cell_map=_compact_cell_map(cell_map)  # plain truncation cut off project tables low on wide sheets
                 )
             }]
         )
@@ -1375,13 +1423,15 @@ def ai_fill_workbook(
                     start_row = table_info.get("start_row", 1)
                     mapping = table_info.get("mapping", {})
 
-                    available_rows = []
                     first_col = next(iter(mapping.values())) if mapping else None
                     if first_col:
-                        r = start_row
-                        while f"[{first_col}{r}]=EMPTY" in cmap:
-                            available_rows.append(r)
-                            r += 1
+                        # The model often reports the header row itself as start_row; the first
+                        # data row is the first row under it whose cells are blank.
+                        for _ in range(4):
+                            if f"[{first_col}{start_row}]=EMPTY" in cmap or not re.search(rf"\[{first_col}{start_row}\]=", cmap):
+                                break
+                            start_row += 1
+                    available_rows = free_table_rows(cmap, mapping, start_row) if mapping else []
 
                     pending_project_tables.append({
                         "sheet_name": sheet_name,
