@@ -68,6 +68,7 @@ class FilledForm(Base):
     doc_checklist = Column(JSON)  # list of docs to attach
     fill_sources = Column(JSON, default=dict)  # "Sheet!Cell" -> "alias_match" | "gpt4o_vision" | "human"
     pending_project_tables = Column(JSON, default=list)
+    row_inserts = Column(JSON, default=list)   # rows added to project tables: [{"sheet","after_row","count","template_row"}], applied in order when the file is written
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

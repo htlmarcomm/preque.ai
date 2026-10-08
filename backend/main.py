@@ -27,6 +27,7 @@ def _migrate_project_reference_columns():
             "ALTER TABLE project_references ADD COLUMN project_value_cr FLOAT",
             "ALTER TABLE project_references ADD COLUMN third_party VARCHAR(200)",
             "ALTER TABLE project_references ADD COLUMN notes TEXT",
+            "ALTER TABLE filled_forms ADD COLUMN row_inserts JSON",
         ]:
             try:
                 conn.execute(text(ddl))

@@ -560,10 +560,16 @@ export default function FillForm() {
         <div className="space-y-6">
           {(() => {
             const current = pendingTables[activePendingIndex]
-            const effCap = (current.max_rows && current.available_row_count) 
-              ? Math.min(current.max_rows, current.available_row_count)
-              : (current.max_rows || current.available_row_count)
-              
+            // No fixed number of projects: a table can take as many as picked, because extra rows are
+            // added to the form. Only an explicit limit written in the form ("list max 10 projects"),
+            // or a stacked block layout that cannot grow, caps the selection.
+            const effCap = current.layout === 'vertical'
+              ? current.available_row_count
+              : (current.max_rows || null)
+            const extraRows = current.layout === 'vertical' || !current.available_row_count
+              ? 0
+              : Math.max(0, pickerSelectedIds.size - current.available_row_count)
+
             const isAtCap = effCap && pickerSelectedIds.size >= effCap
             
             return (
@@ -586,14 +592,15 @@ export default function FillForm() {
                     </p>
                     <p className="text-xs text-gray-400 mt-1.5 font-medium">Table {activePendingIndex + 1} of {pendingTables.length}</p>
                   </div>
-                  {effCap && (
-                    <div className={`text-right ${isAtCap ? 'text-amber-600' : 'text-gray-500'}`}>
-                      <p className="text-sm font-bold">{pickerSelectedIds.size} / {current.max_rows || current.available_row_count} selected</p>
-                      {current.max_rows && current.available_row_count && current.available_row_count < current.max_rows && (
-                         <p className="text-xs">({current.available_row_count} rows available in the form)</p>
-                      )}
-                    </div>
-                  )}
+                  <div className={`text-right ${isAtCap ? 'text-amber-600' : 'text-gray-500'}`}>
+                    <p className="text-sm font-bold">{pickerSelectedIds.size}{effCap ? ` / ${effCap}` : ''} selected</p>
+                    {extraRows > 0 && (
+                      <p className="text-xs text-brand-700">{extraRows} extra row{extraRows > 1 ? 's' : ''} will be added to the form</p>
+                    )}
+                    {!effCap && extraRows === 0 && current.available_row_count > 0 && (
+                      <p className="text-xs">Form has {current.available_row_count} rows; more are added if you pick more</p>
+                    )}
+                  </div>
                 </div>
                 
                 

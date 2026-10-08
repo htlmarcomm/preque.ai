@@ -1097,6 +1097,33 @@ def free_table_rows(cmap: str, mapping: dict, start_row: int, limit: int = 60) -
     return rows
 
 
+def table_row_capacity(file_bytes: bytes, cmap: str, sheet_name: str, mapping: dict, start_row: int) -> list:
+    """Rows that belong to the table's grid, from start_row down.
+
+    Takes the blank rows (see free_table_rows) and, when the form draws the table with cell
+    borders, keeps only the bordered ones, so the spacing between this table and the next
+    heading is not mistaken for table rows. Borderless forms keep all the blank rows.
+    """
+    free = free_table_rows(cmap, mapping, start_row)
+    if not free or not mapping:
+        return free
+    try:
+        from openpyxl.utils import column_index_from_string
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+        ws = wb[sheet_name]
+        col = column_index_from_string(next(iter(mapping.values())))
+        bordered = []
+        for r in free:
+            b = ws.cell(r, col).border
+            if any(getattr(b, side) is not None and getattr(b, side).style for side in ("left", "right", "top", "bottom")):
+                bordered.append(r)
+            else:
+                break
+        return bordered or free
+    except Exception:
+        return free
+
+
 def _as_table_list(data: dict) -> list:
     """The analysis may return `project_tables` (list) or the older single `project_table`."""
     tables = data.get("project_tables")
@@ -1431,7 +1458,7 @@ def ai_fill_workbook(
                             if f"[{first_col}{start_row}]=EMPTY" in cmap or not re.search(rf"\[{first_col}{start_row}\]=", cmap):
                                 break
                             start_row += 1
-                    available_rows = free_table_rows(cmap, mapping, start_row) if mapping else []
+                    available_rows = table_row_capacity(file_bytes, cmap, sheet_name, mapping, start_row) if mapping else []
 
                     pending_project_tables.append({
                         "sheet_name": sheet_name,
@@ -1590,12 +1617,80 @@ def _excel_safe(value):
     return value
 
 
-def write_filled_excel_multi(original_bytes: bytes, sheet_fills: dict) -> bytes:
+def insert_rows_keeping_format(ws, after_row: int, count: int, template_row: int | None = None):
+    """Insert `count` blank rows below `after_row`, giving each the look of `template_row`.
+
+    openpyxl's insert_rows() moves cell values and styles but leaves merged ranges and row
+    heights where they were, which would scramble a form with merged cells; and unmerging
+    drops the borders held by a merged range's hidden cells. So: every cell's style is saved,
+    merged ranges below the insertion point are moved (spanning ones stretched), row heights
+    are shifted, the new rows copy the template row's styles, height and merged cells, and the
+    saved styles are put back on the shifted cells.
+    """
+    from openpyxl.worksheet.cell_range import CellRange
+    template_row = template_row or after_row
+    merges = [CellRange(r.coord) for r in ws.merged_cells.ranges]
+    saved = {}
+    for r in merges:
+        for row in range(r.min_row, r.max_row + 1):
+            for col in range(r.min_col, r.max_col + 1):
+                saved[(row, col)] = copy_style(ws.cell(row, col)._style)
+    for r in merges:
+        ws.unmerge_cells(r.coord)
+    heights = {i: d.height for i, d in ws.row_dimensions.items() if d.height is not None}
+
+    ws.insert_rows(after_row + 1, count)
+
+    last_row = max([ws.max_row] + list(heights)) + count
+    for i in range(after_row + 1, last_row + 1):
+        ws.row_dimensions[i].height = (heights.get(template_row) if i <= after_row + count
+                                       else heights.get(i - count))
+
+    new_merges, template_merges = [], []
+    for r in merges:
+        if r.min_row == r.max_row == template_row:
+            template_merges.append((r.min_col, r.max_col))
+        if r.min_row > after_row:                       # entirely below: move down
+            r.shift(row_shift=count)
+        elif r.max_row > after_row:                     # spans the insertion point: stretch
+            r.expand(down=count)
+        new_merges.append(r.coord)
+    for k in range(1, count + 1):                       # repeat the template row's merges
+        for c1, c2 in template_merges:
+            new_merges.append(f"{openpyxl.utils.get_column_letter(c1)}{after_row + k}:{openpyxl.utils.get_column_letter(c2)}{after_row + k}")
+    for coord in dict.fromkeys(new_merges):
+        ws.merge_cells(coord)
+
+    for (row, col), st in saved.items():                # saved styles back onto the (shifted) cells
+        ws.cell(row + count if row > after_row else row, col)._style = copy_style(st)
+    for k in range(1, count + 1):                       # new rows look like the template row
+        for col in range(1, ws.max_column + 1):
+            src_style = saved.get((template_row, col))
+            if src_style is None:
+                src = ws.cell(template_row, col)
+                src_style = src._style if src.has_style else None
+            if src_style is not None:
+                ws.cell(after_row + k, col)._style = copy_style(src_style)
+
+
+def copy_style(style):
+    import copy
+    return copy.copy(style)
+
+
+def apply_row_inserts(wb, inserts):
+    for ins in inserts or []:
+        if ins.get("sheet") in wb.sheetnames and ins.get("count", 0) > 0:
+            insert_rows_keeping_format(wb[ins["sheet"]], ins["after_row"], ins["count"], ins.get("template_row"))
+
+
+def write_filled_excel_multi(original_bytes: bytes, sheet_fills: dict, row_inserts: list | None = None) -> bytes:
     """
     Write filled values back to their correct sheets, preserving all formatting.
     sheet_fills: {sheet_name: {cell_addr: value}}
     """
     wb = openpyxl.load_workbook(io.BytesIO(original_bytes))
+    apply_row_inserts(wb, row_inserts)
     for sheet_name, fills in sheet_fills.items():
         if sheet_name not in wb.sheetnames:
             print(f"[WARN] Sheet '{sheet_name}' not found in workbook — skipping")
@@ -1882,7 +1977,7 @@ def _rebuild_filled_bytes(form) -> bytes:
         if re.match(r'^[A-Z]{1,3}\d+$', cell):
             sheet_fills.setdefault(sheet_name, {})[cell] = value
 
-    return write_filled_excel_multi(original_bytes, sheet_fills)
+    return write_filled_excel_multi(original_bytes, sheet_fills, form.row_inserts or [])
 
 
 @router.get("/{form_id}/download")

@@ -10,7 +10,7 @@ from routers.forms import (
     build_company_context, get_doc_checklist,
     openai_client, VISION_MODEL, UPLOAD_DIR, OUTPUT_DIR,
     excel_to_all_sheet_maps, build_workbook_form_json,
-    find_field_value_in_record, free_table_rows
+    find_field_value_in_record, free_table_rows, table_row_capacity, write_filled_excel_multi as _write_multi
 )
 from typing import Optional
 import os, json, base64, re, shutil, io
@@ -498,7 +498,8 @@ def fill_project_table(
     if not form:
         raise HTTPException(status_code=404, detail="Form not found")
 
-    pending_tables = form.pending_project_tables or []
+    import copy
+    pending_tables = copy.deepcopy(form.pending_project_tables or [])   # deep copy: edits below must register as a change
 
     # FIX (P0 -- wrote to the wrong table): a single sheet very commonly has
     # BOTH a "Client References" table and a "Major Work Done" table pending
@@ -616,16 +617,41 @@ def fill_project_table(
         with open(orig_path, "rb") as f:
             file_bytes = f.read()
 
-        sheet_maps, _, _, _ = excel_to_all_sheet_maps(file_bytes)
+        # Row numbers here are those of the form as it stands now, i.e. with the rows added to
+        # earlier tables already inserted.
+        inserts = list(form.row_inserts or [])
+        base_bytes = _write_multi(file_bytes, {}, inserts) if inserts else file_bytes
+        sheet_maps, _, _, _ = excel_to_all_sheet_maps(base_bytes)
         cmap = sheet_maps.get(req.sheet_name, "")
 
-        available_rows = free_table_rows(cmap, mapping, start_row) if mapping else []
+        available_rows = table_row_capacity(base_bytes, cmap, req.sheet_name, mapping, start_row) if mapping else []
 
         if not available_rows:
             available_rows = list(range(start_row, start_row + len(req.selected_ids)))
 
-        # Cap selection to available rows
-        rows_to_fill = min(len(req.selected_ids), len(available_rows))
+        # No fixed number of projects: when more are picked than the table has rows, new rows
+        # (same look as the table's last row) are inserted below it when the file is written, and
+        # everything lower on the sheet moves down with them.
+        extra = max(0, len(req.selected_ids) - len(available_rows))
+        if extra:
+            last = available_rows[-1]
+            prefix = f"{req.sheet_name}!"
+            moved = {}
+            for k, v in (form.filled_data or {}).items():
+                m = re.match(r"^(.*!)([A-Z]{1,3})(\d+)$", k)
+                if m and m.group(1) == prefix and int(m.group(3)) > last:
+                    k = f"{prefix}{m.group(2)}{int(m.group(3)) + extra}"
+                moved[k] = v
+            form.filled_data = moved
+            for pt in pending_tables:
+                if pt is not target_table and pt.get("sheet_name") == req.sheet_name:
+                    if pt.get("start_row", 0) > last:
+                        pt["start_row"] += extra
+            inserts.append({"sheet": req.sheet_name, "after_row": last, "count": extra, "template_row": last})
+            form.row_inserts = inserts
+            available_rows = available_rows + list(range(last + 1, last + extra + 1))
+
+        rows_to_fill = len(req.selected_ids)
         ids_to_fill = req.selected_ids[:rows_to_fill]
 
         if req.source == "unified":
