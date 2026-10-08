@@ -32,7 +32,9 @@ def _filtered(db, q, sector, city, scope, status, year_from, year_to, min_value,
         qs = qs.filter(or_(UnifiedProject.project_name.ilike(like), UnifiedProject.client_name.ilike(like),
                            UnifiedProject.third_party.ilike(like), UnifiedProject.location.ilike(like),
                            UnifiedProject.pmc.ilike(like)))
-    for col, val in ((UnifiedProject.sector, sector), (UnifiedProject.city, city), (UnifiedProject.scope, scope),
+    if scope:   # scope may hold several values ("Chiller, Fitout")
+        qs = qs.filter(UnifiedProject.scope.ilike(f"%{scope}%"))
+    for col, val in ((UnifiedProject.sector, sector), (UnifiedProject.city, city),
                      (UnifiedProject.status, status), (UnifiedProject.pmc, pmc)):
         if val:
             qs = qs.filter(col == val)

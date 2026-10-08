@@ -412,6 +412,45 @@ class FillProjectTableRequest(BaseModel):
     table_type: str
     selected_ids: List[int]
     subheading: Optional[str] = None
+    source: Optional[str] = None   # "unified" -> selected_ids are unified_projects ids
+
+
+def _fmt_date(iso):
+    if not iso:
+        return None
+    try:
+        y, m, d = iso.split("-")
+        return f"{d}/{m}/{y}"
+    except ValueError:
+        return iso
+
+
+def _fmt_amount(value_cr, unit):
+    if value_cr is None:
+        return None
+    v = {"lakh": value_cr * 100, "inr": value_cr * 1e7, "million": value_cr * 10}.get(unit, value_cr)
+    return round(v, 2) if unit != "inr" else int(round(v))
+
+
+def unified_field_values(up, unit=None) -> dict:
+    """Canonical table-field key -> cell value for one UnifiedProject row."""
+    return {
+        "project_name": up.project_name,
+        "client_name": up.client_name or up.project_name,
+        "project_type": up.sector,
+        "location": up.location or up.city,
+        "main_contractor": up.third_party,
+        "scope_of_work": up.scope,
+        "area_sqft": round(up.area_sqft) if up.area_sqft else None,
+        "amount": _fmt_amount(up.value_cr, unit),
+        "start_date": _fmt_date(up.start_date),
+        "completion_date": "Ongoing" if up.status == "Ongoing" and not up.end_date else _fmt_date(up.end_date),
+        "contact_name": up.contact_name,
+        "contact_designation": up.contact_designation,
+        "contact_phone": up.contact_phone,
+        "contact_email": up.contact_email,
+    }
+
 
 @router.post("/forms/{form_id}/fill-project-table")
 def fill_project_table(
@@ -474,7 +513,17 @@ def fill_project_table(
         rows_to_fill = min(len(req.selected_ids), len(block_start_rows))
         ids_to_fill = req.selected_ids[:rows_to_fill]
 
-        if req.table_type == "project_reference":
+        if req.source == "unified":
+            from models.database import UnifiedProject
+            ups = {u.id: u for u in db.query(UnifiedProject).filter(UnifiedProject.id.in_(ids_to_fill)).all()}
+            for uid, block_start in zip([i for i in ids_to_fill if i in ups], block_start_rows):
+                vals = unified_field_values(ups[uid], target_table.get("amount_unit"))
+                for field_key, offset in field_row_offsets.items():
+                    val = vals.get(field_key)
+                    if val not in (None, ""):
+                        table_fills[f"{req.sheet_name}!{answer_col}{block_start + offset}"] = val
+
+        elif req.table_type == "project_reference":
             from models.database import ProjectReference
             refs = db.query(ProjectReference).filter(ProjectReference.id.in_(ids_to_fill)).all()
             ref_dict = {r.id: r for r in refs}
@@ -549,7 +598,17 @@ def fill_project_table(
         rows_to_fill = min(len(req.selected_ids), len(available_rows))
         ids_to_fill = req.selected_ids[:rows_to_fill]
 
-        if req.table_type == "project_reference":
+        if req.source == "unified":
+            from models.database import UnifiedProject
+            ups = {u.id: u for u in db.query(UnifiedProject).filter(UnifiedProject.id.in_(ids_to_fill)).all()}
+            for uid, row_num in zip([i for i in ids_to_fill if i in ups], available_rows):
+                vals = unified_field_values(ups[uid], target_table.get("amount_unit"))
+                for m_key, m_col in mapping.items():
+                    val = vals.get(m_key)
+                    if val not in (None, ""):
+                        table_fills[f"{req.sheet_name}!{m_col}{row_num}"] = val
+
+        elif req.table_type == "project_reference":
             from models.database import ProjectReference
             refs = db.query(ProjectReference).filter(ProjectReference.id.in_(ids_to_fill)).all()
             # Preserve selection order

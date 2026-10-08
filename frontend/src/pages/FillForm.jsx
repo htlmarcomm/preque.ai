@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { Upload, Image, FileSpreadsheet, Sparkles, CheckCircle2, AlertCircle, Download, Copy, FileCheck, ChevronRight, X, Save, Loader2, RotateCcw, FileText, Search, Eye, Check, Database } from 'lucide-react'
 import { agentApi, formsApi, docsApi, projectPickerApi, projectDataApi } from '../lib/api'
 import { useFillForm } from '../contexts/FillFormContext'
+import UnifiedPicker from '../components/UnifiedPicker'
 
 const BASE_STEPS = ['Upload', 'Processing', 'Review', 'Output']
 
@@ -47,6 +48,9 @@ export default function FillForm() {
     googleSheetLink, setGoogleSheetLink,
     reset
   } = useFillForm()
+  // Project tables are picked from the unified project register by default; the older
+  // per-source pickers stay available through the toggle.
+  const [useUnifiedPicker, setUseUnifiedPicker] = useState(true)
 
   const fileRef = useRef()
   const [downloading, setDownloading] = useState(false)
@@ -382,7 +386,8 @@ export default function FillForm() {
         current.sheet_name,
         current.table_type,
         Array.from(pickerSelectedIds),
-        current.subheading
+        current.subheading,
+        useUnifiedPicker ? 'unified' : undefined
       )
       
       const freshResult = await formsApi.get(result.form_id)
@@ -593,7 +598,14 @@ export default function FillForm() {
                 
                 
                 <div className="p-5 space-y-4">
-                  {current.table_type === 'project_reference' ? (
+                  <div className="flex justify-end -mb-2">
+                    <button type="button" className="text-xs text-gray-500 hover:text-brand-700 underline" onClick={() => setUseUnifiedPicker(v => !v)}>
+                      {useUnifiedPicker ? 'Use the older project sources instead' : 'Use the unified project register'}
+                    </button>
+                  </div>
+                  {useUnifiedPicker ? (
+                    <UnifiedPicker key={activePendingIndex} table={current} selected={pickerSelectedIds} setSelected={setPickerSelectedIds} cap={effCap} />
+                  ) : current.table_type === 'project_reference' ? (
                     <div className="space-y-4">
                       <div className="flex gap-2 flex-wrap items-center bg-gray-50 p-2 rounded-lg border border-gray-200">
                         <div className="relative flex-1 min-w-[180px] max-w-xs">

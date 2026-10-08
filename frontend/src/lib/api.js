@@ -254,9 +254,9 @@ export const projectDataApi = {
 export const projectPickerApi = {
   getReferences: (params) => api.get('/api/project-picker/references', { params }),
   getDetails: (params) => api.get('/api/project-picker/details', { params }),
-  fillProjectTable: (formId, sheetName, tableType, selectedIds, subheading) =>
+  fillProjectTable: (formId, sheetName, tableType, selectedIds, subheading, source) =>
     api.post(`/api/agent/forms/${formId}/fill-project-table`, {
-      sheet_name: sheetName, table_type: tableType, selected_ids: selectedIds, subheading
+      sheet_name: sheetName, table_type: tableType, selected_ids: selectedIds, subheading, source
     }),
 }
 

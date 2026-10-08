@@ -91,7 +91,7 @@ Answer THREE questions about this sheet and return a single JSON object.
    distinction, or all columns seem fillable, return empty lists for both:
    {{"fillable_columns": ["B", "D"], "reserved_columns": ["E", "F", "G"]}}
 
-3. "project_table": does this sheet contain a repeating table where each row represents ONE
+3. "project_tables": does this sheet contain one OR MORE repeating tables where each row represents ONE
    PROJECT (a list of client engagements/jobs)? Two distinct kinds:
    - TYPE "project_reference": each row asks for CLIENT CONTACT/REFERENCE details tied to a
      past project — client name, contact person, designation, phone, email — used so a
@@ -115,28 +115,45 @@ Answer THREE questions about this sheet and return a single JSON object.
    the numbered rows also share the same repeating column structure asking for the same kind of
    project/client facts. Also scan nearby text for an explicit max row count instruction (e.g.
    "list only 10 projects at max", "top 5 projects", "maximum 3 references") — extract that
-   number if present, else null. If not a project table, just return {{"is_project_table": false}}.
+   number if present, else null. A sheet often stacks SEVERAL project tables one under another, each with its own heading
+   (e.g. "Details of Work completed ... in the last five years" followed further down by
+   "Details of Current Work in Progress"). Return ONE object per table, in top-to-bottom order,
+   each with its own heading, start_row and mapping. For each table also return:
+   - "status_filter": "Completed" if the heading is about completed / past / last-N-years work,
+     "Ongoing" if it is about current / in-progress / ongoing work, else null.
+   - "sector_hint": the project category the heading asks for (e.g. "Hospitality", "Hospital",
+     "Data Centre", "Residential", "Industrial") or null when it asks for all kinds of project.
+   - "scope_hint": the work scope the heading asks for (e.g. "MEP", "HVAC", "Electrical") or null.
+   - "years_back": the number N when the heading limits work to "the last N years", else null.
+   - "amount_unit": the unit the contract value column asks for: "cr" (INR Crore), "lakh", "inr"
+     (plain rupees) or "million" - read it from that column's header; null if unclear.
+   If the sheet has no project table return an empty list.
 
 Return ONLY this JSON object, no markdown, no explanation:
 {{
   "classification": "FILLABLE",
   "columns": {{"fillable_columns": [], "reserved_columns": []}},
-  "project_table": {{
+  "project_tables": [{{
     "is_project_table": true,
-    "table_type": "project_reference",
+    "table_type": "project_details",
     "subheading": "The exact heading text found (e.g. 'Major work done'), or null",
+    "status_filter": "Completed",
+    "sector_hint": null,
+    "scope_hint": "MEP",
+    "years_back": 5,
+    "amount_unit": "cr",
     "start_row": 7,
     "max_rows": 10,
     "mapping": {{
-      "project_name": "D", "client_name": "E", "location": "F", "area_sqft": "G",
-      "amount": "H", "start_date": "I", "completion_date": "J", "contact_name": "K",
-      "contact_designation": "L", "contact_phone": "M", "contact_email": "N",
-      "scope_of_work": "O"
+      "project_name": "D", "client_name": "E", "project_type": "F", "location": "G",
+      "main_contractor": "H", "scope_of_work": "I", "area_sqft": "J",
+      "amount": "K", "start_date": "L", "completion_date": "M", "contact_name": "N",
+      "contact_designation": "O", "contact_phone": "P", "contact_email": "Q"
     }}
-  }}
+  }}]
 }}
 Only include mapping keys for columns that actually exist as headers in this sheet — do not
-invent columns. Map any column asking for "Scope of Work" to the "scope_of_work" key.
+invent columns. Map any column asking for "Scope of Work" to the "scope_of_work" key, "Type of Project" (hotel, residential, commercial...) to "project_type", and "Main Contractor" to "main_contractor". A "Client" column maps to "client_name".
 
 CELL MAP:
 {cell_map}
@@ -348,15 +365,17 @@ FIELD_KEYWORDS = {
     "project_name": ["project name", "name of project"],
     "location": ["location"],
     "area_sqft": ["area (sqft)", "area sqft", "area"],
-    "amount": ["project cost", "contract value", "project value", "value in lacs", "value"],
+    "amount": ["project cost", "contract price", "contract sum", "contract value", "project value", "value in lacs", "value"],
     "duration": ["duration"],
-    "scope_of_work": ["scope of work", "scope"],
+    "scope_of_work": ["scope of work", "scope of works", "scope"],
     "contact_name": ["contact person name", "concern person", "contact person"],
     "contact_designation": ["designation"],
     "contact_phone": ["contact details", "contact no", "phone", "mobile"],
     "contact_email": ["email"],
     "start_date": ["start date"],
-    "completion_date": ["completion date", "end date"],
+    "completion_date": ["completion date", "end date", "proposed end"],
+    "project_type": ["type of project", "project type"],
+    "main_contractor": ["main contractor", "contractor"],
 }
 
 
@@ -1026,8 +1045,16 @@ def _default_sheet_analysis() -> dict:
         "classification": "FILLABLE",
         "fillable_columns": [],
         "reserved_columns": [],
-        "table_info": {"is_project_table": False},
+        "table_info": [],
     }
+
+
+def _as_table_list(data: dict) -> list:
+    """The analysis may return `project_tables` (list) or the older single `project_table`."""
+    tables = data.get("project_tables")
+    if tables is None and data.get("project_table"):
+        tables = [data["project_table"]]
+    return [t for t in (tables or []) if isinstance(t, dict) and t.get("is_project_table")]
 
 
 def analyze_sheet(sheet_name: str, cell_map: str) -> dict:
@@ -1060,7 +1087,7 @@ def analyze_sheet(sheet_name: str, cell_map: str) -> dict:
                 "role": "user",
                 "content": SHEET_ANALYSIS_PROMPT.format(
                     sheet_name=sheet_name,
-                    cell_map=cell_map[:6000]  # keep the call cheap
+                    cell_map=cell_map[:16000]  # stacked project tables can sit far down the sheet; 6000 cut the lower ones off
                 )
             }]
         )
@@ -1072,7 +1099,7 @@ def analyze_sheet(sheet_name: str, cell_map: str) -> dict:
             "classification": "FILLABLE" if classification != "INFO_ONLY" else "INFO_ONLY",
             "fillable_columns": columns.get("fillable_columns", []),
             "reserved_columns": columns.get("reserved_columns", []),
-            "table_info": data.get("project_table") or {"is_project_table": False},
+            "table_info": _as_table_list(data),
         }
     except Exception as e:
         print(f"[WARN] Sheet analysis failed for '{sheet_name}': {e} — defaulting to FILLABLE / no column restriction / no project table")
@@ -1083,7 +1110,8 @@ def analyze_sheet(sheet_name: str, cell_map: str) -> dict:
 PROJECT_TABLE_FIELDS = {
     "project_name", "client_name", "location", "area_sqft", "amount",
     "start_date", "completion_date", "duration", "scope_of_work",
-    "contact_name", "contact_designation", "contact_phone", "contact_email"
+    "contact_name", "contact_designation", "contact_phone", "contact_email",
+    "project_type", "main_contractor"
 }
 
 
@@ -1112,6 +1140,20 @@ def normalize_detected_table_info(table_info: dict, cell_map: str) -> dict:
     reference_markers = SECTION_KEYWORDS["Customer References"]
     project_keys = {"project_name", "location", "area_sqft", "amount", "duration", "scope_of_work", "start_date", "completion_date"}
     contact_keys = {"contact_name", "contact_designation", "contact_phone", "contact_email"}
+
+    # "Details of Current Work in Progress" / "Details of Work completed ..." headings
+    # decide which projects belong in the table even if the AI left status_filter blank.
+    if not table_info.get("status_filter"):
+        if re.search(r'in progress|ongoing|on-going|current work|current project', subheading_text):
+            table_info["status_filter"] = "Ongoing"
+        elif re.search(r'completed|past|previous|last \d+ years|last (three|five|ten) years', subheading_text):
+            table_info["status_filter"] = "Completed"
+    if str(table_info.get("status_filter") or "").lower() not in ("completed", "ongoing"):
+        table_info["status_filter"] = None
+    else:
+        table_info["status_filter"] = str(table_info["status_filter"]).capitalize()
+    if table_info.get("amount_unit") not in ("cr", "lakh", "inr", "million"):
+        table_info["amount_unit"] = None
 
     if any(marker in subheading_text for marker in project_markers):
         table_info["table_type"] = "project_details"
@@ -1325,12 +1367,14 @@ def ai_fill_workbook(
             if not vblocks:
                 # Reuse the project-table detection already produced by the
                 # combined analyze_sheet() call above -- no second AI call needed.
-                table_info = normalize_detected_table_info(sheet_table_info.get(sheet_name, {"is_project_table": False}), cmap)
-                if table_info.get("is_project_table"):
-                    print(f"  [Table Mode] '{sheet_name}' is a Project Table. Adding to pending_project_tables.")
+                for table_info in sheet_table_info.get(sheet_name, []) or []:
+                    table_info = normalize_detected_table_info(table_info, cmap)
+                    if not table_info.get("is_project_table"):
+                        continue
+                    print(f"  [Table Mode] '{sheet_name}' has a Project Table ('{table_info.get('subheading')}'). Adding to pending_project_tables.")
                     start_row = table_info.get("start_row", 1)
                     mapping = table_info.get("mapping", {})
-                    
+
                     available_rows = []
                     first_col = next(iter(mapping.values())) if mapping else None
                     if first_col:
@@ -1338,7 +1382,7 @@ def ai_fill_workbook(
                         while f"[{first_col}{r}]=EMPTY" in cmap:
                             available_rows.append(r)
                             r += 1
-                    
+
                     pending_project_tables.append({
                         "sheet_name": sheet_name,
                         "table_type": table_info.get("table_type", "project_details"),
@@ -1346,9 +1390,14 @@ def ai_fill_workbook(
                         "start_row": start_row,
                         "mapping": mapping,
                         "available_row_count": len(available_rows),
-                        "max_rows": table_info.get("max_rows")
+                        "max_rows": table_info.get("max_rows"),
+                        "status_filter": table_info.get("status_filter"),
+                        "sector_hint": table_info.get("sector_hint"),
+                        "scope_hint": table_info.get("scope_hint"),
+                        "years_back": table_info.get("years_back"),
+                        "amount_unit": table_info.get("amount_unit"),
                     })
-                    
+
                     for r in available_rows:
                         for c_letter in mapping.values():
                             protected_cells_by_sheet[sheet_name].add(f"{c_letter}{r}")
