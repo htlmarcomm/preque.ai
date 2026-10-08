@@ -1678,10 +1678,73 @@ def copy_style(style):
     return copy.copy(style)
 
 
+def normalize_table_rows(ws, rows, texts=None):
+    """Give every row we are about to write the same cell layout as a well-formed table row.
+
+    Real forms are often irregular: some blank table rows have merged cells (e.g. C:E, F:K, L:P ...)
+    and others, further down, are plain unmerged cells, so values written in the same columns
+    land misaligned. The reference row is the closest well-formed (most merged cells) row among
+    the one just above the first target row and the targets themselves; its single-row merges
+    and cell styles are applied to the target rows, and a row's height grows when wrapped text
+    needs more lines. Rows above that we do not write to are left exactly as they were.
+    """
+    from openpyxl.worksheet.cell_range import CellRange
+    from openpyxl.utils import get_column_letter as L
+    import math
+    if not rows:
+        return
+    rows = sorted(rows)
+
+    def row_merges(r):
+        return [CellRange(m.coord) for m in ws.merged_cells.ranges if m.min_row == m.max_row == r]
+
+    candidates = [rows[0] - 1] + rows
+    ref = max(candidates, key=lambda r: (len(row_merges(r)), -candidates.index(r))) if candidates else rows[0]
+    ref_merges = row_merges(ref)
+    if not ref_merges:
+        return
+    lo = min(m.min_col for m in ref_merges)
+    hi = max(m.max_col for m in ref_merges)
+    ref_styles = {c: copy_style(ws.cell(ref, c)._style) for c in range(lo, hi + 1)}
+
+    for t in rows:
+        if t == ref:
+            continue
+        for m in row_merges(t):
+            ws.unmerge_cells(m.coord)
+        for m in ref_merges:
+            ws.merge_cells(f"{L(m.min_col)}{t}:{L(m.max_col)}{t}")
+        for c, st in ref_styles.items():
+            ws.cell(t, c)._style = copy_style(st)
+
+    from openpyxl.styles import Alignment
+    from openpyxl.utils import column_index_from_string
+    texts = texts or {}
+    for t in rows:                                       # wrap text, and make the row tall enough
+        row_texts = {column_index_from_string(c): str(v) for c, v in (texts.get(str(t)) or {}).items()}
+        need = 1
+        for m in ref_merges:
+            cell = ws.cell(t, m.min_col)
+            cell.alignment = Alignment(horizontal=cell.alignment.horizontal, vertical=cell.alignment.vertical or "center",
+                                       wrap_text=True)
+            width = sum((ws.column_dimensions[L(c)].width or 8.43) for c in range(m.min_col, m.max_col + 1))
+            for col, text in row_texts.items():
+                if m.min_col <= col <= m.max_col:
+                    need = max(need, math.ceil(len(text) * 1.15 / max(width, 1)))
+        have = ws.row_dimensions[t].height or 15
+        ws.row_dimensions[t].height = max(have, 15 * need)
+
+
 def apply_row_inserts(wb, inserts):
+    """Apply, in the order recorded, the row insertions and row clean-ups made while filling tables."""
     for ins in inserts or []:
-        if ins.get("sheet") in wb.sheetnames and ins.get("count", 0) > 0:
-            insert_rows_keeping_format(wb[ins["sheet"]], ins["after_row"], ins["count"], ins.get("template_row"))
+        if ins.get("sheet") not in wb.sheetnames:
+            continue
+        ws = wb[ins["sheet"]]
+        if ins.get("op") == "normalize":
+            normalize_table_rows(ws, ins.get("rows") or [], ins.get("texts"))
+        elif ins.get("count", 0) > 0:
+            insert_rows_keeping_format(ws, ins["after_row"], ins["count"], ins.get("template_row"))
 
 
 def write_filled_excel_multi(original_bytes: bytes, sheet_fills: dict, row_inserts: list | None = None) -> bytes:

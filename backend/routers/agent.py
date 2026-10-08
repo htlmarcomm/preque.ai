@@ -696,6 +696,19 @@ def fill_project_table(
                     if val:
                         table_fills[f"{req.sheet_name}!{m_col}{row_num}"] = val
 
+        # Make every row we wrote look like a proper table row (the form's own blank rows are often
+        # merged differently from one another), and tall enough for wrapped text.
+        used_rows = available_rows[:len(ids_to_fill)]
+        texts = {}
+        for addr, val in table_fills.items():
+            m = re.match(r"^.*!([A-Z]{1,3})(\d+)$", addr)
+            if m:
+                texts.setdefault(m.group(2), {})[m.group(1)] = val
+        if used_rows:
+            norm_ops = list(form.row_inserts or [])
+            norm_ops.append({"op": "normalize", "sheet": req.sheet_name, "rows": used_rows, "texts": texts})
+            form.row_inserts = norm_ops
+
         rows_available = len(available_rows)
 
     # Merge into filled_data
