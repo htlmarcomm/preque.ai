@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
-import { Database, FileText, FolderOpen, History, Zap, Archive, Briefcase, Search, Users, LogOut, Layers } from 'lucide-react'
+import { Database, FileText, FolderOpen, History, Zap, Archive, Briefcase, Search, Users, LogOut, Layers, Presentation, ExternalLink } from 'lucide-react'
 import FillForm from './pages/FillForm'
 import CompanyDB from './pages/CompanyDB'
 import FormHistory from './pages/FormHistory'
@@ -21,6 +21,9 @@ import { authApi, getToken, clearToken } from './lib/api'
 // every filled form. Without a route to it, that checklist could only ever
 // grow via the one-time /api/documents/seed list -- there was no way for a
 // user to add a newly-obtained certificate to it at all.
+// The deck platform is a separate app (own login). The button just opens it.
+const DECK_APP_URL = import.meta.env.VITE_DECK_APP_URL || 'https://htl-deck-app.vercel.app'
+
 const navItems = [
   { to: '/',          icon: Zap,        label: 'Fill Form'    },
   { to: '/history',   icon: History,    label: 'History'      },
@@ -85,6 +88,12 @@ export default function App() {
               </NavLink>
             ))}
           </nav>
+          <a href={DECK_APP_URL} target="_blank" rel="noopener noreferrer"
+            className="mx-1 mb-4 flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-semibold bg-red-600 text-white hover:bg-red-700 transition-colors shadow-sm">
+            <Presentation size={17} />
+            <span className="flex-1">Deck App</span>
+            <ExternalLink size={13} className="opacity-80" />
+          </a>
           <div className="px-3 pt-4 border-t border-gray-100">
             <p className="text-xs text-gray-700 font-medium">{username}</p>
             <button onClick={logout} className="mt-2 flex items-center gap-1.5 text-xs text-gray-400 hover:text-red-600 transition-colors">
