@@ -1311,8 +1311,7 @@ def ai_fill_sheet(
                 col_letter = re.match(r'^([A-Z]+)', k).group(1)
                 if reserved_cols and col_letter in reserved_cols:
                     continue
-                if fillable_cols and reserved_cols and col_letter not in fillable_cols:
-                    continue
+                # (fillable-column whitelist deliberately not applied; see is_allowed_col)
                     
                 new_fills[k] = str(v)
                 
@@ -1326,6 +1325,83 @@ def ai_fill_sheet(
             print(f"  [GPT-4o] Sheet '{sheet_name}' page {i+1}: Error — {e}")
 
     return all_fills
+
+
+_UNIT_HINT_RE = re.compile(r"\(\s*(?:in\s+|rs\.?\s*in\s+|inr\s+in\s+)?(lacs?|lakhs?|crores?|cr\.?)\s*\)", re.I)
+
+
+def fix_units(cell_map: str, fills: dict) -> dict:
+    """Convert plain-rupee amounts to the unit the question asks for.
+
+    The company database holds rupees, but forms often ask "Annual Turn over (Lacs)" or
+    "(Cr.)". A whole-rupee figure written under such a label is off by a factor of 100,000
+    (or 10 million). The unit comes from the nearest label to the left, in the same row or just above.
+    """
+    texts = {}
+    for m in re.finditer(r"\[([A-Z]+)(\d+)\]='([^']*)'", cell_map):
+        texts[(m.group(1), int(m.group(2)))] = m.group(3)
+
+    def col_index(c):
+        n = 0
+        for ch in c:
+            n = n * 26 + ord(ch) - 64
+        return n
+
+    out = {}
+    for coord, value in fills.items():
+        out[coord] = value
+        raw = str(value).replace(",", "").strip()
+        given = re.fullmatch(r"(\d+(?:\.\d+)?)\s*₹?\s*(cr|crore|crores|lakh|lakhs|lac|lacs)\.?", raw, re.I)
+        if given:
+            # "201.39 ₹ Cr" from the financial records: restate in the unit the question asks for.
+            amount = float(given.group(1)) * (1e7 if given.group(2).lower().startswith("cr") else 1e5)
+            raw = str(amount)
+        elif not re.fullmatch(r"\d{7,}(\.\d+)?", raw):
+            continue
+        m = re.match(r"([A-Z]+)(\d+)", coord)
+        col, row = m.group(1), int(m.group(2))
+        unit = None
+        for r in range(row, max(row - 7, 0), -1):
+            hits = [t for (c, rr), t in texts.items() if rr == r and col_index(c) < col_index(col)]
+            for t in hits:
+                u = _UNIT_HINT_RE.search(t)
+                if u:
+                    unit = u.group(1).lower()
+                    break
+            if unit:
+                break
+        if not unit:
+            if given:
+                out[coord] = f"₹ {given.group(1)} Cr" if given.group(2).lower().startswith("cr") else f"₹ {given.group(1)} Lakh"
+            continue
+        divisor = 1e5 if unit.startswith(("lac", "lakh")) else 1e7
+        out[coord] = f"{float(raw) / divisor:.2f}".rstrip("0").rstrip(".")
+    return out
+
+
+_YEAR_ONLY_RE = re.compile(r"^(fy\s*)?\d{4}\s*[-/]\s*\d{2,4}$", re.I)
+
+
+def _cell_texts(cell_map: str) -> dict:
+    return {(m.group(1), int(m.group(2))): m.group(3)
+            for m in re.finditer(r"\[([A-Z]+)(\d+)\]='([^']*)'", cell_map)}
+
+
+def _group_question(texts: dict, coord: str):
+    """Nearest question text above (or beside) a sub-row cell, e.g. the 'Profit of firm (Lacs)' over its year rows."""
+    def idx(c):
+        n = 0
+        for ch in c:
+            n = n * 26 + ord(ch) - 64
+        return n
+    m = re.match(r"([A-Z]+)(\d+)", coord)
+    col, row = idx(m.group(1)), int(m.group(2))
+    for r in range(row, max(row - 8, 0), -1):
+        for (c, rr), t in sorted(texts.items(), key=lambda kv: idx(kv[0][0])):
+            t = t.strip()
+            if rr == r and idx(c) < col and len(t) > 3 and not _YEAR_ONLY_RE.match(t) and not t.startswith("--- Section:")                     and not re.fullmatch(r"\d+[.)]?", t):
+                return t
+    return None
 
 
 def ai_fill_workbook(
@@ -1411,8 +1487,10 @@ def ai_fill_workbook(
                 col_letter = re.match(r'^([A-Z]+)', coord).group(1)
                 if reserved_cols and col_letter in reserved_cols:
                     return False
-                if fillable_cols and reserved_cols and col_letter not in fillable_cols:
-                    return False
+                # Only the columns the model marks as the client's own (reserved) are skipped. A whitelist
+                # of "fillable" columns used to apply too, but the model's list changes from run to run
+                # and sometimes names the label columns and omits the answer column, which then
+                # filled almost nothing.
                 return True
 
             if sheet_name not in protected_cells_by_sheet:
@@ -1480,6 +1558,7 @@ def ai_fill_workbook(
                             protected_cells_by_sheet[sheet_name].add(f"{c_letter}{r}")
 
             if matcher:
+                sheet_texts = _cell_texts(cmap)
                 candidates = extract_candidates_from_map(cmap)
                 for coord, labels in candidates.items():
                     if coord in protected_cells_by_sheet.get(sheet_name, set()):
@@ -1514,6 +1593,18 @@ def ai_fill_workbook(
                     ))
                     section = field_context.get("section", "")
 
+                    # A sub-row that is only a year ("2022-2023") belongs to the question above it
+                    # ("Annual Turn over (Lacs)" vs "Profit of firm (Lacs)"). Without that question the
+                    # same year label matched whichever figure was found first, so the profit rows were
+                    # filled with turnover. Put the group question in front of the year.
+                    year_only_cell = False
+                    if any(_YEAR_ONLY_RE.match(l.strip()) for l in context_labels):
+                        group = _group_question(sheet_texts, coord)
+                        if group:
+                            year_only_cell = True
+                            context_labels = [f"{group} {l}" if _YEAR_ONLY_RE.match(l.strip()) else l for l in context_labels]
+                            section = group
+
                     if _is_attachment_only_request(context_labels, section):
                         resolved_cells[coord] = "Attached"
                         fill_sources[f"{sheet_name}!{coord}"] = "attachment_default"
@@ -1525,6 +1616,12 @@ def ai_fill_workbook(
                         resolved_cells[coord] = financial_value
                         fill_sources[f"{sheet_name}!{coord}"] = "financial_match"
                         match_summary["alias_matched"] += 1
+                        continue
+
+                    if year_only_cell:
+                        # A bare year can only be answered from the financial records for that exact
+                        # year. A loose text match on the year alone returns whatever figure was once
+                        # saved under it (it filled "Profit" with turnover), so leave it blank instead.
                         continue
 
                     context_value = _match_company_context_value(context_labels, section, company_context)
@@ -1590,6 +1687,9 @@ def ai_fill_workbook(
             all_fills[sheet_name] = {**resolved_cells, **ai_fills}
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+    for sn in list(all_fills):
+        all_fills[sn] = {k: v for k, v in fix_units(sheet_maps[sn], all_fills[sn]).items() if str(v).strip() != ""}
 
     combined_map = "\n".join(
         f"--- SHEET: {sn} ---\n{sheet_maps[sn]}" for sn in fillable_sheets

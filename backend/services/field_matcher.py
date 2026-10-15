@@ -32,6 +32,16 @@ def normalize_label(text: str) -> str:
     t = re.sub(r'\s+', ' ', t).strip()
     return t
 
+# field_key (or a phrase in the field's label) -> other ways forms ask for it
+BUILTIN_SYNONYMS = {
+    "company_name": ["name of the firm", "name of firm", "firm name", "name of the company", "name of the organisation",
+                     "name of organisation", "full company name"],
+    "cin_number": ["registration/incorporation no", "registration incorporation number", "incorporation no",
+                   "company registration no", "business registration no"],
+    "type of firm": ["type of the firm", "form of company", "constitution of the firm", "type of organisation"],
+}
+
+
 class FieldMatcher:
     def __init__(self, db: Session):
         self.db = db
@@ -48,6 +58,14 @@ class FieldMatcher:
             if norm_label:
                 self.index[norm_label] = field
             
+            # Built-in wording that forms commonly use for these fields (extends the stored aliases)
+            for needle, extra in BUILTIN_SYNONYMS.items():
+                if field.field_key == needle or needle in (field.field_label or "").lower():
+                    for alias in extra:
+                        norm_alias = normalize_label(alias)
+                        if norm_alias:
+                            self.index.setdefault(norm_alias, field)
+
             # Add aliases
             if field.aliases:
                 for alias in field.aliases:
@@ -138,6 +156,7 @@ def extract_candidates_from_map(cell_map: str, max_hops: int = 4) -> Dict[str, L
             name = chr(65 + rem) + name
         return name
 
+    SECTION_BANNER_RE = re.compile(r'^--- Section: (.+) ---$')
     ROMAN_HEADING_RE = re.compile(r'^[IVXLCDM]{1,4}\s*[\.\)\-:]')
 
     def is_usable_label(val: str) -> bool:
@@ -178,6 +197,15 @@ def extract_candidates_from_map(cell_map: str, max_hops: int = 4) -> Dict[str, L
                 continue  # merge-continuation gap we intentionally excluded -- keep walking
             if val == "EMPTY":
                 return None  # a genuine blank cell breaks the chain
+            banner = SECTION_BANNER_RE.match(val.strip())
+            if banner:
+                # A numbered question row ("1 | Name of the firm | <answer>") has its question
+                # merged across the label columns, which the map shows as a section banner, with the
+                # answer cell blank to its right. That banner IS this cell's label. Headings are not
+                # numbered, so they never become labels.
+                numbered = any(re.fullmatch(r"\d+[\.\)]?", (grid.get((get_col_name(i), row)) or "").strip())
+                               for i in range(1, probe_idx))
+                return banner.group(1) if numbered and is_usable_label(banner.group(1)) else None
             return val if is_usable_label(val) else None
         return None
 

@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 import numpy as np
 from typing import List, Dict, Optional
 from sqlalchemy.orm import Session
@@ -7,14 +8,24 @@ from models.database import DocumentChunk
 
 logger = logging.getLogger(__name__)
 
+_load_lock = threading.Lock()
+
+
 class VectorStore:
     _instance = None
     _model = None
 
     def __new__(cls):
+        # The instance is published only AFTER the model has loaded, and callers wait on the
+        # lock while it loads. Before, `_instance` was set first and the (slow, minutes on a cold
+        # start) load ran afterwards, so a request arriving during the load got an instance whose
+        # model was still None and every search failed with "'NoneType' has no attribute 'encode'".
         if cls._instance is None:
-            cls._instance = super(VectorStore, cls).__new__(cls)
-            cls._instance._load_model()
+            with _load_lock:
+                if cls._instance is None:
+                    inst = super(VectorStore, cls).__new__(cls)
+                    inst._load_model()
+                    cls._instance = inst
         return cls._instance
 
     def _load_model(self):

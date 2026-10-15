@@ -54,6 +54,25 @@ def _seed_unified_projects():
 
 _seed_unified_projects()
 
+
+def _warm_search_model():
+    # Load the embedding model in the background at startup so the first Fill Form request does not
+    # sit waiting on it (a cold load can take minutes).
+    import threading
+
+    def _load():
+        try:
+            from services.vector_store import VectorStore
+            VectorStore()
+            print("Search model ready")
+        except Exception as e:
+            print("Search model failed to load:", e)
+
+    threading.Thread(target=_load, daemon=True).start()
+
+
+_warm_search_model()
+
 # First-boot admin seeding: if no users exist yet, create one from
 # INITIAL_ADMIN_USERNAME/INITIAL_ADMIN_PASSWORD env vars so there's a way to
 # log in at all on a fresh deploy. Only runs when the users table is empty --
