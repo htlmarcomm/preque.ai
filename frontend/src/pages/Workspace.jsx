@@ -32,6 +32,12 @@ export default function Workspace() {
   const fetchPackages = async () => {
     const res = await workspaceApi.list()
     setPackages(res.data)
+    // ?pkg=<id> opens that package straight away (used by the "documents folder" link in Fill Form)
+    const wanted = new URLSearchParams(window.location.search).get('pkg')
+    if (wanted && !activePackage) {
+      const match = res.data.find(p => String(p.id) === wanted)
+      if (match) setActivePackage(match)
+    }
   }
 
   const fetchFiles = async () => {

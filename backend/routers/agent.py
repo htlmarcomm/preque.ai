@@ -251,9 +251,14 @@ def process_excel_form(
     )
     db.add(form); db.commit(); db.refresh(form)
 
+    # Every cell answered "Attached" gets its documents collected into a Draft Workspace folder,
+    # ready for the user to review (see services/doc_attachments.py).
+    documents_package = _documents_package_for(db, form, stored_fills)
+
     return {
         "form_id": form.id,
         "client_name": client_name,
+        "documents_package": documents_package,
         "total_fields": total_empty_cells,
         "auto_filled": total_filled_cells,
         "unknown_count": len(enriched_unknown),
@@ -266,6 +271,35 @@ def process_excel_form(
         "pending_project_tables": pending_project_tables,
         "form_structure_json": structure_name
     }
+
+
+def _attached_cells(filled: dict) -> list:
+    out = []
+    for key, v in (filled or {}).items():
+        value = v.get("value") if isinstance(v, dict) else v
+        if str(value or "").strip().lower().startswith(("attached", "as attached")):
+            label = (v.get("label") if isinstance(v, dict) else "") or ""
+            question = label.split(" - ", 1)[-1].replace("--- Section:", " ").replace("---", " ")
+            out.append({"cell": key, "question": question})
+    return out
+
+
+def _documents_package_for(db, form, filled: dict):
+    try:
+        from services.doc_attachments import build_documents_package
+        return build_documents_package(db, form.client_name or "Client", form.id, _attached_cells(filled))
+    except Exception as e:
+        print("[WARN] Could not build the documents folder:", e)
+        return None
+
+
+@router.post("/forms/{form_id}/build-documents-folder")
+def build_documents_folder(form_id: int, db: Session = Depends(get_db)):
+    """(Re)build the Workspace documents folder for a filled form."""
+    form = db.query(FilledForm).filter(FilledForm.id == form_id).first()
+    if not form:
+        raise HTTPException(status_code=404, detail="Form not found")
+    return _documents_package_for(db, form, form.filled_data or {}) or {"package_id": None, "folders": 0, "files": 0, "missing": []}
 
 
 @router.post("/process-image")

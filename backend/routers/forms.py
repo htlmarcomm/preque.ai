@@ -7,6 +7,8 @@ import openpyxl, io, os, json, re, base64, tempfile, subprocess, shutil
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from routers.project_files import read_excel_preview
+from services.pq_rules import Facts, resolve_by_rules, contained_alias_match, turnover_for_year
+from services.doc_attachments import asks_for_document
 
 router = APIRouter()
 UPLOAD_DIR = "uploads/forms"
@@ -1387,7 +1389,7 @@ def _cell_texts(cell_map: str) -> dict:
             for m in re.finditer(r"\[([A-Z]+)(\d+)\]='([^']*)'", cell_map)}
 
 
-def _group_question(texts: dict, coord: str):
+def _group_question(texts: dict, coord: str, exclude=()):
     """Nearest question text above (or beside) a sub-row cell, e.g. the 'Profit of firm (Lacs)' over its year rows."""
     def idx(c):
         n = 0
@@ -1399,7 +1401,7 @@ def _group_question(texts: dict, coord: str):
     for r in range(row, max(row - 8, 0), -1):
         for (c, rr), t in sorted(texts.items(), key=lambda kv: idx(kv[0][0])):
             t = t.strip()
-            if rr == r and idx(c) < col and len(t) > 3 and not _YEAR_ONLY_RE.match(t) and not t.startswith("--- Section:")                     and not re.fullmatch(r"\d+[.)]?", t):
+            if rr == r and idx(c) < col and len(t) > 3 and t not in exclude and not _YEAR_ONLY_RE.match(t) and not t.startswith("--- Section:")                     and not re.fullmatch(r"\d+[.)]?", t):
                 return t
     return None
 
@@ -1559,6 +1561,7 @@ def ai_fill_workbook(
 
             if matcher:
                 sheet_texts = _cell_texts(cmap)
+                pq_facts = Facts(matcher.fields)
                 candidates = extract_candidates_from_map(cmap)
                 for coord, labels in candidates.items():
                     if coord in protected_cells_by_sheet.get(sheet_name, set()):
@@ -1598,10 +1601,12 @@ def ai_fill_workbook(
                     # same year label matched whichever figure was found first, so the profit rows were
                     # filled with turnover. Put the group question in front of the year.
                     year_only_cell = False
+                    group_text = ""
                     if any(_YEAR_ONLY_RE.match(l.strip()) for l in context_labels):
                         group = _group_question(sheet_texts, coord)
                         if group:
                             year_only_cell = True
+                            group_text = group
                             context_labels = [f"{group} {l}" if _YEAR_ONLY_RE.match(l.strip()) else l for l in context_labels]
                             section = group
 
@@ -1618,10 +1623,27 @@ def ai_fill_workbook(
                         match_summary["alias_matched"] += 1
                         continue
 
+                    # Deterministic rules for common questions (no AI involved).
+                    rule_group = group_text or (_group_question(sheet_texts, coord, exclude=set(l.strip() for l in context_labels)) or "")
+                    rule_value = resolve_by_rules(context_labels, rule_group, section, pq_facts)
+                    if rule_value:
+                        resolved_cells[coord] = rule_value
+                        fill_sources[f"{sheet_name}!{coord}"] = "rule_match"
+                        match_summary["alias_matched"] += 1
+                        continue
+
                     if year_only_cell:
                         # A bare year can only be answered from the financial records for that exact
                         # year. A loose text match on the year alone returns whatever figure was once
                         # saved under it (it filled "Profit" with turnover), so leave it blank instead.
+                        # The one exception is turnover: the company data keeps it under each year's label.
+                        if re.search(r"turn ?over|sales|revenue", group_text, re.I):
+                            year_label = next((m.group(0) for m in (re.search(r"(?:fy\s*)?\d{4}\s*[-/]\s*\d{2,4}", l, re.I) for l in context_labels) if m), "")
+                            turnover = turnover_for_year(year_label, pq_facts)
+                            if turnover:
+                                resolved_cells[coord] = turnover
+                                fill_sources[f"{sheet_name}!{coord}"] = "rule_match"
+                                match_summary["alias_matched"] += 1
                         continue
 
                     context_value = _match_company_context_value(context_labels, section, company_context)
@@ -1639,6 +1661,21 @@ def ai_fill_workbook(
                     if best_match:
                         resolved_cells[coord] = best_match.value
                         fill_sources[f"{sheet_name}!{coord}"] = "alias_match"
+                        match_summary["alias_matched"] += 1
+                        continue
+
+                    # Fallbacks that still need no AI: a stored label/alias that appears in the question,
+                    # then "Attached" when the question asks for a document.
+                    alias_value = contained_alias_match(context_labels, pq_facts)
+                    if alias_value:
+                        resolved_cells[coord] = alias_value
+                        fill_sources[f"{sheet_name}!{coord}"] = "alias_contained"
+                        match_summary["alias_matched"] += 1
+                        continue
+                    question_text = " ".join(context_labels + ([rule_group] if rule_group else []) + [section or ""])
+                    if asks_for_document(" ".join(context_labels)) or asks_for_document(question_text):
+                        resolved_cells[coord] = "Attached"
+                        fill_sources[f"{sheet_name}!{coord}"] = "attachment_default"
                         match_summary["alias_matched"] += 1
 
             protected_set = protected_cells_by_sheet.get(sheet_name, set())

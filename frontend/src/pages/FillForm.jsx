@@ -3,6 +3,7 @@ import { Upload, Image, FileSpreadsheet, Sparkles, CheckCircle2, AlertCircle, Do
 import { agentApi, formsApi, docsApi, projectPickerApi, projectDataApi } from '../lib/api'
 import { useFillForm } from '../contexts/FillFormContext'
 import UnifiedPicker from '../components/UnifiedPicker'
+import DocumentsFolderCard from '../components/DocumentsFolderCard'
 
 const BASE_STEPS = ['Upload', 'Processing', 'Review', 'Output']
 
@@ -1073,6 +1074,8 @@ export default function FillForm() {
             ))}
           </div>
 
+          <DocumentsFolderCard info={result.documents_package} />
+
           {/* Auto-filled answers */}
           <div className="card">
             <div className="p-4 border-b border-gray-100 flex items-center justify-between">
@@ -1310,6 +1313,8 @@ export default function FillForm() {
               })}
             </div>
           </div>
+
+          <DocumentsFolderCard info={result.documents_package} />
 
           {/* Document checklist */}
           {result.doc_checklist?.length > 0 && (
